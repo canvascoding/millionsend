@@ -47,6 +47,7 @@ import {
   fixedWindowCounter,
   getWarmup,
   hasPendingDoi,
+  hasRevocableConfirmation,
   heldByNewDomainLimit,
   INBOX_KEY_FROM_MESSAGE,
   INBOX_KEY_SCOPE_MESSAGE,
@@ -89,6 +90,7 @@ import {
   reservedSenderRefusal,
   reserveQuota,
   reviewBacklogLimit,
+  revokeContactConfirmation,
   revokePendingDoiProperties,
   roundUpToSlot,
   SCHEDULED_AT_FORMS,
@@ -684,6 +686,7 @@ function toAcceptPayload(body: SendEmailRequest, domainId: string | null): Accep
     subject: body.subject,
     html: body.html,
     text: body.text,
+    tracking: body.tracking,
     tags: body.tags ? Object.fromEntries(body.tags.map((t) => [t.name, t.value])) : null,
     headers: body.headers && Object.keys(body.headers).length > 0 ? body.headers : undefined,
     attachments: attachments && attachments.length > 0 ? attachments : undefined,
@@ -1311,6 +1314,7 @@ function registerContactRootRoutes(app: OpenAPIHono<Env>, deps: ApiDeps): void {
                 firstName: t.firstName,
                 lastName: t.lastName,
                 unsubscribed: t.unsubscribed,
+                confirmation: t.confirmation,
                 properties: t.properties,
               })
               .from(t)
@@ -1397,7 +1401,11 @@ function registerContactRootRoutes(app: OpenAPIHono<Env>, deps: ApiDeps): void {
             // A batch never re-subscribes anyone: unsubscribed:false on an
             // opted-out contact is ignored, and the retained one-click
             // suppression stays. Re-subscribing is the explicit PATCH.
-            const unsubscribe = row.unsubscribed === true && !found.unsubscribed;
+            const unsubscribe =
+              row.unsubscribed === true &&
+              (!found.unsubscribed ||
+                hasRevocableConfirmation(found.confirmation) ||
+                hasPendingDoi(found.properties));
             idByKey.set(row.key, found.id);
             // A row restating what is stored is not written: updated_at stays,
             // no contact.updated fires. The item still reports "updated" and
@@ -1414,10 +1422,24 @@ function registerContactRootRoutes(app: OpenAPIHono<Env>, deps: ApiDeps): void {
                 updatedAt: new Date(),
                 ...(row.firstName !== undefined ? { firstName: row.firstName } : {}),
                 ...(row.lastName !== undefined ? { lastName: row.lastName } : {}),
-                ...(unsubscribe ? { unsubscribed: true, unsubscribedAt: new Date() } : {}),
-                ...(Object.keys(row.properties).length > 0
-                  ? { properties: sql`${t.properties} || ${JSON.stringify(row.properties)}::jsonb` }
+                ...(unsubscribe
+                  ? {
+                      unsubscribed: true,
+                      unsubscribedAt: new Date(),
+                      confirmation: revokeContactConfirmation(t.confirmation),
+                    }
                   : {}),
+                ...(row.unsubscribed === true && hasPendingDoi(found.properties)
+                  ? {
+                      properties: revokePendingDoiProperties(
+                        sql`${t.properties} || ${JSON.stringify(row.properties)}::jsonb`,
+                      ),
+                    }
+                  : Object.keys(row.properties).length > 0
+                    ? {
+                        properties: sql`${t.properties} || ${JSON.stringify(row.properties)}::jsonb`,
+                      }
+                    : {}),
               })
               .where(and(eq(t.id, found.id), eq(t.teamId, teamId)))
               .returning(contactSnapshotColumns);
@@ -1496,7 +1518,12 @@ function registerContactRootRoutes(app: OpenAPIHono<Env>, deps: ApiDeps): void {
             continue;
           }
           succeed(row, id, "updated");
-          if (row.unsubscribed === true && !update.found.unsubscribed) {
+          if (
+            row.unsubscribed === true &&
+            (!update.found.unsubscribed ||
+              hasRevocableConfirmation(update.found.confirmation) ||
+              hasPendingDoi(update.found.properties))
+          ) {
             activity.push({ teamId, contactId: id, type: "unsubscribed" });
           }
           for (const [topicId, subscribed] of row.topicSubs) {
@@ -1569,13 +1596,15 @@ function registerContactRootRoutes(app: OpenAPIHono<Env>, deps: ApiDeps): void {
     // records real flips. Properties are merged, so the stored-map cap is
     // checked against the merged key set.
     const [before] = await db
-      .select({ ...contactSnapshotColumns, properties: t.properties })
+      .select({ ...contactSnapshotColumns, properties: t.properties, confirmation: t.confirmation })
       .from(t)
       .where(teamContactWhere(teamId, idOrEmail));
     if (!before) return undefined;
     // An explicit withdrawal also cancels a still-pending DOI request, even
     // though both pending and withdrawn contacts already have this flag set.
-    const revokesDoi = body.unsubscribed === true && hasPendingDoi(before.properties);
+    const revokesDoi =
+      body.unsubscribed === true &&
+      (hasPendingDoi(before.properties) || hasRevocableConfirmation(before.confirmation));
     let properties: SQL | undefined;
     if (incoming) {
       const keys = new Set(Object.keys(before.properties));
@@ -1612,6 +1641,9 @@ function registerContactRootRoutes(app: OpenAPIHono<Env>, deps: ApiDeps): void {
                   }
                 : {}),
               ...(properties !== undefined ? { properties } : {}),
+              ...(body.unsubscribed === true
+                ? { confirmation: revokeContactConfirmation(t.confirmation) }
+                : {}),
             })
             .where(teamContactWhere(teamId, idOrEmail))
             .returning(contactSnapshotColumns)
@@ -3860,10 +3892,7 @@ export function createApi(deps: ApiDeps): OpenAPIHono<Env> {
   // registered by registerContactRootRoutes and share the contacts policy.
   app.use("/audiences/*", requireApiKey, enforceRateLimit, requireFullAccess);
   registerContactRootRoutes(app, deps);
-  registerContactConfirmationRoutes(app, deps.db, {
-    source: "api",
-    enqueue: deps.enqueueWebhookDeliveries,
-  });
+  registerContactConfirmationRoutes(app, deps);
 
   app.use("/contact-properties", requireApiKey, enforceRateLimit, requireFullAccess);
   app.use("/contact-properties/*", requireApiKey, enforceRateLimit, requireFullAccess);

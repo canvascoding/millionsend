@@ -3,6 +3,7 @@ import {
   emitSuppressionEvents,
   hashRecipient,
   recordContactActivity,
+  revokeContactConfirmation,
   revokePendingDoiProperties,
 } from "@millionsend/core";
 import { type Db, getDb, schema } from "@millionsend/db";
@@ -189,6 +190,7 @@ export async function POST(request: Request, ctx: { params: Promise<{ token: str
       .update(schema.contacts)
       .set({
         unsubscribed: true,
+        confirmation: revokeContactConfirmation(schema.contacts.confirmation),
         properties: revokePendingDoiProperties(schema.contacts.properties),
         // coalesce keeps the FIRST unsubscribe time: mail scanners re-hit
         // one-click links, and repeats must not walk the timestamp forward.
