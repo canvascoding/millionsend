@@ -46,6 +46,7 @@ import {
   findTopicOptOuts,
   fixedWindowCounter,
   getWarmup,
+  hasPendingDoi,
   heldByNewDomainLimit,
   INBOX_KEY_FROM_MESSAGE,
   INBOX_KEY_SCOPE_MESSAGE,
@@ -88,6 +89,7 @@ import {
   reservedSenderRefusal,
   reserveQuota,
   reviewBacklogLimit,
+  revokePendingDoiProperties,
   roundUpToSlot,
   SCHEDULED_AT_FORMS,
   type SendRefusal,
@@ -159,6 +161,7 @@ import { secureHeaders } from "hono/secure-headers";
 import { INTERNAL_AUTH, registerMcp } from "./mcp.js";
 import { loggedBody, maskEmailPathSegments } from "./request-log.js";
 import { registerApiKeyRoutes } from "./routes/api-keys.js";
+import { registerContactConfirmationRoutes } from "./routes/contact-confirmations.js";
 import { registerContactPropertyRoutes } from "./routes/contact-properties.js";
 import { type DomainsSesDeps, registerDomainRoutes } from "./routes/domains.js";
 import { registerInboxSendRoutes } from "./routes/inbox-send.js";
@@ -696,7 +699,10 @@ function toAcceptPayload(body: SendEmailRequest, domainId: string | null): Accep
  * case-insensitive, and contact map keys are matched the same way. */
 type ContactPropertyTypes = Map<string, ContactPropertyType>;
 
-async function loadContactPropertyTypes(db: Db, teamId: string): Promise<ContactPropertyTypes> {
+export async function loadContactPropertyTypes(
+  db: Db,
+  teamId: string,
+): Promise<ContactPropertyTypes> {
   const p = schema.contactProperties;
   const rows = await db.select({ key: p.key, type: p.type }).from(p).where(eq(p.teamId, teamId));
   return new Map(rows.map((r) => [r.key.toLowerCase(), r.type]));
@@ -723,7 +729,7 @@ export function numericPropertyValue(value: unknown): number | null {
  * 'number' that don't parse to a finite number, or as 'date' that don't read
  * as a date. A date is stored trimmed, as written, never rewritten.
  */
-function coerceContactProperties(
+export function coerceContactProperties(
   input: Record<string, unknown>,
   types: ContactPropertyTypes,
 ):
@@ -1567,6 +1573,9 @@ function registerContactRootRoutes(app: OpenAPIHono<Env>, deps: ApiDeps): void {
       .from(t)
       .where(teamContactWhere(teamId, idOrEmail));
     if (!before) return undefined;
+    // An explicit withdrawal also cancels a still-pending DOI request, even
+    // though both pending and withdrawn contacts already have this flag set.
+    const revokesDoi = body.unsubscribed === true && hasPendingDoi(before.properties);
     let properties: SQL | undefined;
     if (incoming) {
       const keys = new Set(Object.keys(before.properties));
@@ -1580,7 +1589,9 @@ function registerContactRootRoutes(app: OpenAPIHono<Env>, deps: ApiDeps): void {
         for (const key of incoming.removed) properties = sql`${properties} - ${key}::text`;
       }
     }
+    if (revokesDoi) properties = revokePendingDoiProperties(properties ?? t.properties);
     const dirty =
+      revokesDoi ||
       (body.first_name !== undefined && body.first_name !== before.firstName) ||
       (body.last_name !== undefined && body.last_name !== before.lastName) ||
       (body.unsubscribed !== undefined && body.unsubscribed !== before.unsubscribed) ||
@@ -1618,7 +1629,11 @@ function registerContactRootRoutes(app: OpenAPIHono<Env>, deps: ApiDeps): void {
         enqueue: contactEvents.enqueue,
       });
     }
-    if (row && body.unsubscribed !== undefined && before.unsubscribed !== body.unsubscribed) {
+    if (
+      row &&
+      body.unsubscribed !== undefined &&
+      (before.unsubscribed !== body.unsubscribed || revokesDoi)
+    ) {
       await recordContactActivity(
         db,
         {
@@ -3845,6 +3860,10 @@ export function createApi(deps: ApiDeps): OpenAPIHono<Env> {
   // registered by registerContactRootRoutes and share the contacts policy.
   app.use("/audiences/*", requireApiKey, enforceRateLimit, requireFullAccess);
   registerContactRootRoutes(app, deps);
+  registerContactConfirmationRoutes(app, deps.db, {
+    source: "api",
+    enqueue: deps.enqueueWebhookDeliveries,
+  });
 
   app.use("/contact-properties", requireApiKey, enforceRateLimit, requireFullAccess);
   app.use("/contact-properties/*", requireApiKey, enforceRateLimit, requireFullAccess);

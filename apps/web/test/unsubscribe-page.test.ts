@@ -152,6 +152,44 @@ describe("/unsubscribe/[token] route", () => {
     expect((await call("POST", token)).headers.get("location")).toBe("https://acme.example/bye");
   });
 
+  it("revokes an open DOI even when the recipient has never been active", async () => {
+    vi.stubEnv("APP_BASE_URL", APP);
+    const teamId = await createTeam(db, "pending-doi");
+    const [contact] = await db
+      .insert(schema.contacts)
+      .values({
+        teamId,
+        email: "pending@x.com",
+        unsubscribed: true,
+        properties: {
+          canvas_newsletter_state: "pending",
+          canvas_newsletter_doi_request_id: "pending-doi-request",
+          original: "kept",
+        },
+      })
+      .returning();
+    if (!contact) throw new Error("Pending fixture missing");
+    const token = makeUnsubscribeToken({ contactId: contact.id, secretKey });
+    expect((await call("POST", token, "List-Unsubscribe=One-Click")).status).toBe(200);
+    const [withdrawn] = await db
+      .select()
+      .from(schema.contacts)
+      .where(eq(schema.contacts.id, contact.id));
+    expect(withdrawn?.unsubscribed).toBe(true);
+    expect(withdrawn?.properties).toMatchObject({
+      canvas_newsletter_state: "cancelled",
+      original: "kept",
+    });
+    expect(withdrawn?.properties.canvas_newsletter_doi_revoked_at).toBeTruthy();
+    const before = withdrawn?.properties.canvas_newsletter_doi_revoked_at;
+    expect((await call("POST", token, "List-Unsubscribe=One-Click")).status).toBe(200);
+    const [again] = await db
+      .select()
+      .from(schema.contacts)
+      .where(eq(schema.contacts.id, contact.id));
+    expect(again?.properties.canvas_newsletter_doi_revoked_at).toBe(before);
+  });
+
   it("retains a global unsubscribe as a suppression, once", async () => {
     vi.stubEnv("APP_BASE_URL", APP);
     const teamId = await createTeam(db, "acme");

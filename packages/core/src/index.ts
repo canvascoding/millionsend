@@ -575,6 +575,7 @@ export {
   newDomainLimitEtas,
   newDomainLimitStatus,
 } from "./new-domain-limit.js";
+export { hasPendingDoi, revokePendingDoiProperties } from "./newsletter-doi.js";
 export {
   accountLocale,
   claimNotification,
