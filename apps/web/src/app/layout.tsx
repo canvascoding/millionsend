@@ -54,6 +54,15 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         <NextIntlClientProvider>
           <Providers>{children}</Providers>
         </NextIntlClientProvider>
+        <footer style={{ padding: 12, textAlign: "center", fontSize: 12 }}>
+          <a
+            href="https://github.com/canvascoding/millionsend/tree/codex/newsletter-doi-live"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Modified MillionSend · Source code (AGPL-3.0)
+          </a>
+        </footer>
       </body>
     </html>
   );

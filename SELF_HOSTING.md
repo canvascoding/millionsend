@@ -1756,3 +1756,13 @@ aws s3 cp infra/millionsend-ses.cfn.yaml s3://millionsend-public/millionsend-ses
 ```
 
 </details>
+
+### Canvas newsletter deployment additions
+
+This deployment branch preserves the upstream baseline with targeted confirmation
+and privacy patches. Set `MILLIONSEND_DISABLE_ENGAGEMENT_TRACKING=true` to stop
+engagement recording even for links/pixels already present in historical mail.
+Signed click redirects still work. Also disable the sending domain's open/click
+settings to avoid adding those elements to new campaign mail. Verification sends
+additionally use the per-message tracking opt-out. The dashboard footer links to
+the corresponding modified source in this branch (AGPL-3.0).

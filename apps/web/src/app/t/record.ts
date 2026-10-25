@@ -270,6 +270,8 @@ export async function recordEngagement(
   enqueueWebhookDeliveriesFn?: WebhookEnqueue,
   hit?: EngagementHit,
 ): Promise<void> {
+  // Instance privacy policy: keep old signed redirects working, without recording engagement.
+  if (process.env.MILLIONSEND_DISABLE_ENGAGEMENT_TRACKING === "true") return;
   // A raw non-uuid string must never reach a uuid column — Postgres would 500.
   if (!z.uuid().safeParse(emailId).success) return;
 

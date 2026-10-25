@@ -908,3 +908,22 @@ describe("open endpoint /t/o", () => {
     expect(await counts(emailId, teamId, "opened")).toEqual({ events: 0, counter: 0 });
   });
 });
+
+it("an instance privacy stop keeps historical links working without engagement events", async () => {
+  const { emailId, teamId } = await seedEmail();
+  const url = "https://example.com/confirm#mailbox-token";
+  const token = await clickToken(emailId, url);
+  vi.stubEnv("MILLIONSEND_DISABLE_ENGAGEMENT_TRACKING", "true");
+  try {
+    const click = await clickGet(...req(token));
+    expect(click.status).toBe(302);
+    expect(click.headers.get("location")).toBe(url);
+    const pixel = await openGet(...req(makeOpenToken({ emailId, secretKey })));
+    expect(pixel.status).toBe(200);
+    expect(await counts(emailId, teamId, "clicked")).toEqual({ events: 0, counter: 0 });
+    expect(await counts(emailId, teamId, "opened")).toEqual({ events: 0, counter: 0 });
+    expect(await counts(emailId, teamId, "prefetched")).toEqual({ events: 0, counter: 0 });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
