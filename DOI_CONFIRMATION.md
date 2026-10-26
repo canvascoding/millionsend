@@ -1,35 +1,35 @@
 # Guarded newsletter confirmation
 
-This Canvas deployment adds `POST /contacts/{id}/confirm` for the newsletter
-backend. It requires the same full-access API authentication as other contact
-writes. The mailbox backend, not a public caller, validates the single-use link
-before submitting `request_id` and `confirmed_at`.
+The authenticated newsletter backend stages mailbox requests with
+`POST /contacts/confirmation-requests`. A contact stays inactive until the backend
+has verified the mailbox token and submitted the matching, unexpired request to
+`POST /contacts/{id}/confirm`. Native confirmation metadata is authoritative;
+editable custom properties cannot manufacture confirmation.
 
-The contact must still be inactive and carry the matching
-`canvas_newsletter_doi_request_id`, `canvas_newsletter_doi_requested_at` and
-`canvas_newsletter_state=pending`. The request expires after 24 hours.
-Confirmation checks every suppression, preserves every suppression row, and
-records the confirmed address, time and `double_opt_in` method while activating.
-It updates no names, original timestamps, topics or segment memberships.
-Repeated confirmation of the same receipt is idempotent.
+By default, historical inactive contacts and all suppressions remain untouched.
+An explicit fresh request with `allow_resubscribe:true` can stage an inactive
+contact again. Only newsletter unsubscribe suppressions qualify: their exact IDs
+are captured with the new request and remain in place until its confirmation.
+The guarded confirmation transaction can then remove those exact unsubscribe
+rows and activate the contact. Bounce, complaint, manual, erased or subsequently
+changed suppressions are never cleared by this flow. No name, original creation
+time, unrelated property, topic preference or segment membership is changed.
 
-Pending contacts start with `unsubscribed=true`; this flag alone cannot express
-a later withdrawal. Explicit `PATCH unsubscribed:true` of a pending DOI contact
-and the hosted global unsubscribe path therefore cancel its pending request
-and record `canvas_newsletter_doi_revoked_at`, even if it has never been active.
-An old link cannot override that withdrawal. Contacts without a pending DOI
-binding retain their existing behavior.
+A later withdrawal cancels a pending request even when the contact has never
+been active. Old, superseded, revoked and expired links cannot reactivate it.
+Confirmation and suppression writers take a common address/contact lock order,
+including when the contact does not exist yet. A new hard block takes precedence
+over an older newsletter unsubscribe; re-adding the same block remains idempotent.
+Suppression removal, confirmation and webhook outbox writes commit together;
+worker wakeup happens after commit. An activation conflict rolls back removal.
 
-The generic `PATCH unsubscribed:false` behavior remains available to existing
-clients. The newsletter backend deliberately does not use it, because it also
-clears a retained unsubscribe suppression.
+The general `PATCH unsubscribed:false` operator action retains its prior behavior.
+The storefront backend uses the guarded confirmation endpoint instead.
+Its local evidence keeps each consent request and exact notice separately,
+including the earlier withdrawal and the later fresh mailbox confirmation.
 
-The implementation is based on the currently deployed revision
-`09a829fed059ea0698c0487bbe598b2045665b8d`; deploying it does not require a
-database migration or an unrelated upstream upgrade.
-
-Tests cover all suppression origins, pending versus explicitly withdrawn,
-existing consent and topic choices, expired/wrong requests, tenant/key scope,
-idempotency and simultaneous confirmation/withdrawal. The API suite normally
-uses PGlite and can also run against a fresh isolated local PostgreSQL database
-named `newsletter_doi_test` using `DOI_POSTGRES_TEST_URL` and `DATABASE_URL`.
+The fork includes upstream main plus these changes. Its nullable `confirmation`
+JSONB column was introduced by migration `0063_lazy_scarecrow`; resubscription
+adds metadata fields without another SQL migration. Tests exercise all block
+origins, profile preservation, tenant/key scope, idempotency, renewal, expiry,
+withdrawal, concurrent suppression writes and real PostgreSQL/SMTP delivery.
