@@ -297,3 +297,32 @@ it("dashboard withdrawal revokes a pending confirmation even on an inactive cont
   expect(after?.confirmation?.state).toBe("revoked");
   expect(after?.unsubscribed).toBe(true);
 });
+
+it("withdrawal keeps typed property normalization and cancels a legacy pending request", async () => {
+  const { teamId, caller } = await seed();
+  await db.insert(schema.contactProperties).values({ teamId, key: "joined", type: "date" });
+  const properties = {
+    canvas_newsletter_state: "pending",
+    canvas_newsletter_doi_request_id: randomUUID(),
+  };
+  const [contact] = await db
+    .insert(schema.contacts)
+    .values({ teamId, email: "legacy@example.com", unsubscribed: true, properties })
+    .returning();
+  if (!contact) throw new Error("Missing contact fixture");
+
+  await caller.audience.contacts.update({
+    id: contact.id,
+    unsubscribed: true,
+    properties: { ...properties, joined: " 2026-10-26 " },
+  });
+
+  const [after] = await db.select().from(schema.contacts).where(eq(schema.contacts.id, contact.id));
+  expect(after?.unsubscribed).toBe(true);
+  expect(after?.properties.joined).toBe("2026-10-26");
+  expect(after?.properties.canvas_newsletter_state).toBe("cancelled");
+  expect(after?.properties.canvas_newsletter_doi_request_id).toBe(
+    properties.canvas_newsletter_doi_request_id,
+  );
+  expect(after?.properties.canvas_newsletter_doi_revoked_at).toBeTruthy();
+});

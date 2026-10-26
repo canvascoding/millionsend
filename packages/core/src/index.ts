@@ -292,7 +292,10 @@ export {
   CONTACT_PROPERTY_VALUE_MAX_LENGTH,
   type ContactPropertyType,
   contactPropertiesChange,
+  numericPropertyValue,
+  storedPropertyValue,
 } from "./contact-properties.js";
+export { type ContactPropertyTypes, loadContactPropertyTypes } from "./contact-property-types.js";
 export {
   CONTENT_REVEAL_FIELDS,
   CONTENT_REVEAL_JUSTIFICATION_MAX,
@@ -550,6 +553,7 @@ export {
   type MailboxProvider,
   mailboxProvider,
   sentWithoutComplaintFeedback,
+  sesAttempted,
 } from "./mailbox-providers.js";
 export {
   getMonitorSettingsRow,
@@ -804,6 +808,8 @@ export {
 } from "./ssrf.js";
 export {
   applyStatusCas,
+  complainedEmail,
+  deliveredEmail,
   type EmailStatus,
   endQueuedEmails,
   highestStatus,
@@ -863,6 +869,7 @@ export {
   type FlagTriggerOptions,
   flagImitatedBrand,
   flagTrigger,
+  guardrailMetricOf,
   pruneTeamStandings,
   STANDING_WINDOW_DAYS,
   saveTeamStandings,

@@ -1,0 +1,21 @@
+# The whole tracking edge: one Caddy container. Certs live in the caddy_data
+# volume, so they survive restarts and are not re-issued (which would burn
+# Let's Encrypt rate limits). Ports 80 (ACME HTTP-01 + redirect) and 443.
+services:
+  caddy:
+    # Pinned by digest: the upgrade steps never pull, so a bare tag stays on
+    # whatever the box pulled first. Dependabot moves the digest.
+    image: caddy:2@sha256:504a44d7d74bd2bc28a66afc4774912fc21223ca8a67734af1c54ab2f999b489
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file: .env
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
