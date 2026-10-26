@@ -1,8 +1,11 @@
+import { randomBytes } from "node:crypto";
 import type { Db } from "@millionsend/db";
 import { schema } from "@millionsend/db";
 import { createTeam, createTestDb } from "@millionsend/test-utils";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, expect, it } from "vitest";
+import { encryptEmailBody } from "../src/crypto/envelope.js";
+import { EnvKeyring } from "../src/crypto/keyring.js";
 import { eraseRecipient } from "../src/erase-recipient.js";
 import { hashRecipient } from "../src/suppressions.js";
 
@@ -17,6 +20,57 @@ beforeAll(async () => {
   otherTeamId = await createTeam(db, "other-team");
 });
 afterAll(() => close());
+
+it.each(["queued", "queued_quota", "sent"] as const)(
+  "erases sealed content and unstructured metadata and prevents an unclaimed %s send",
+  async (status) => {
+    const address = `erase-${status}@example.com`;
+    const id = await seedEmail(teamId, [address, "another@example.com"]);
+    const foreign = await seedEmail(otherTeamId, [address]);
+    const keyring = EnvKeyring.fromBase64(randomBytes(32).toString("base64"));
+    const body = await encryptEmailBody(
+      { html: `<p>Private name ${address}</p>`, text: address },
+      keyring,
+      { teamId, rowId: id },
+    );
+    await db
+      .update(schema.emails)
+      .set({
+        subject: `Private name ${address}`,
+        headers: { "X-Private": address },
+        tags: { person: address },
+        bodyCiphertext: body.ciphertext,
+        bodyIv: body.iv,
+        bodyWrappedDek: body.wrappedDek,
+        bodyKeyVersion: body.keyVersion,
+        attachments: "sealed attachment",
+        media: "sealed review",
+        latestStatus: status,
+        sentAt: status === "sent" ? new Date() : null,
+      })
+      .where(eq(schema.emails.id, id));
+    await eraseRecipient(db, teamId, address);
+    const [row] = await db.select().from(schema.emails).where(eq(schema.emails.id, id));
+    expect(row?.to).toEqual(["[erased]", "another@example.com"]);
+    expect(row?.subject).toBe("[erased]");
+    for (const field of [
+      "headers",
+      "tags",
+      "bodyCiphertext",
+      "bodyIv",
+      "bodyWrappedDek",
+      "bodyKeyVersion",
+      "attachments",
+      "media",
+    ] as const)
+      expect(row?.[field]).toBeNull();
+    expect(row?.bodyPurgedAt).toBeInstanceOf(Date);
+    expect(row?.latestStatus).toBe(status === "sent" ? "sent" : "canceled");
+    const [untouched] = await db.select().from(schema.emails).where(eq(schema.emails.id, foreign));
+    expect(untouched?.to).toEqual([address]);
+    expect((await eraseRecipient(db, teamId, address)).emails).toBe(0);
+  },
+);
 
 const ADDRESS = "bob@example.com";
 
@@ -106,19 +160,13 @@ it("tombstones every copy of the address for the team, keeps the suppression has
     .select()
     .from(schema.emailEvents)
     .where(eq(schema.emailEvents.emailId, emailId));
-  expect(event?.data).toEqual({
-    eventType: "Bounce",
-    bounce: {
-      bounceType: "Permanent",
-      bouncedRecipients: [{ emailAddress: "[erased]", diagnosticCode: "[erased]" }],
-    },
-  });
+  expect(event?.data).toBeNull();
   const [d] = await db
     .select()
     .from(schema.webhookDeliveries)
     .where(eq(schema.webhookDeliveries.id, delivery.id));
-  expect(d?.payload).toEqual({ type: "email.bounced", data: { to: ["[erased]"], subject: "s" } });
-  expect(d?.lastResponseBody).toBe("stored [erased] ok");
+  expect(d?.payload).toEqual({ type: "email.bounced", data: { to: ["[erased]"] } });
+  expect(d?.lastResponseBody).toBeNull();
   const suppressions = await db
     .select({ email: schema.suppressions.email, emailHash: schema.suppressions.emailHash })
     .from(schema.suppressions)
@@ -251,10 +299,8 @@ it("drops the fetcher's address and user agent from open and click events and th
     .select({ type: schema.emailEvents.type, data: schema.emailEvents.data })
     .from(schema.emailEvents)
     .where(eq(schema.emailEvents.emailId, emailId));
-  expect(events.find((e) => e.type === "opened")?.data).toEqual({ open: { timestamp: at } });
-  expect(events.find((e) => e.type === "clicked")?.data).toEqual({
-    click: { link: "https://example.com/", timestamp: at },
-  });
+  expect(events.find((e) => e.type === "opened")?.data).toBeNull();
+  expect(events.find((e) => e.type === "clicked")?.data).toBeNull();
   const [d] = await db
     .select({ payload: schema.webhookDeliveries.payload })
     .from(schema.webhookDeliveries)

@@ -1,6 +1,7 @@
 import type { Db } from "@millionsend/db";
 import { schema } from "@millionsend/db";
 import { type AnyColumn, and, eq, inArray, isNotNull, or, type SQL, sql } from "drizzle-orm";
+import { purgedEmailBodyColumns } from "./email-retention.js";
 import { extractAddrSpec, hashRecipient, normalizeAddress } from "./suppressions.js";
 
 /** Replaces every erased copy of an address so readers see a deliberate gap, not a blank. */
@@ -31,6 +32,14 @@ export async function eraseRecipient(
   teamId: string,
   address: string,
 ): Promise<EraseRecipientResult> {
+  return db.transaction((tx) => eraseRecipientTransaction(tx as unknown as Db, teamId, address));
+}
+
+async function eraseRecipientTransaction(
+  db: Db,
+  teamId: string,
+  address: string,
+): Promise<EraseRecipientResult> {
   const addr = normalizeAddress(extractAddrSpec(address));
   const plain = escapeRegex(addr);
   // Whole JSON string values that mention the address collapse to the
@@ -53,25 +62,28 @@ export async function eraseRecipient(
     .select({ id: e.id })
     .from(e)
     .where(and(eq(e.teamId, teamId), mentions));
+  // Serialize with send claims and provider-event writes. Rows already
+  // handed off cannot be recalled; a still-unclaimed queued row is canceled.
+  await db
+    .select({ id: e.id })
+    .from(e)
+    .where(and(eq(e.teamId, teamId), mentions))
+    .orderBy(e.id)
+    .for("update");
 
   // Events first: their scope is derived from the recipient lists that the
   // emails update below tombstones. An open or click carries the fetcher's
   // IP and user agent — personal data on their own — so those keys go too,
   // and such rows are selected even though they never mention the address.
   const ev = schema.emailEvents;
-  const withoutFetcher = sql`${ev.data} #- '{open,ipAddress}' #- '{open,userAgent}' #- '{click,ipAddress}' #- '{click,userAgent}'`;
-  const hasFetcher = sql`(${ev.data}->'open' ?| array['ipAddress','userAgent'] or ${ev.data}->'click' ?| array['ipAddress','userAgent'])`;
   const events = await db
     .update(ev)
     .set({
-      data: sql`regexp_replace((${withoutFetcher})::text, ${json}, ${jsonTombstone}, 'gi')::jsonb`,
+      // Provider payloads can contain the person's name in subjects or
+      // diagnostics without repeating the address. Keep outcome metadata only.
+      data: null,
     })
-    .where(
-      and(
-        inArray(ev.emailId, teamEmailsMentioning),
-        or(sql`${ev.data}::text ~* ${json}`, hasFetcher),
-      ),
-    )
+    .where(and(inArray(ev.emailId, teamEmailsMentioning), isNotNull(ev.data)))
     .returning({ id: ev.id });
 
   // Scoped by endpoint, not email: test deliveries have no email_id, and a
@@ -89,13 +101,17 @@ export async function eraseRecipient(
   const deliveries = await db
     .update(d)
     .set({
-      payload: sql`regexp_replace((${withoutFetcherPayload})::text, ${json}, ${jsonTombstone}, 'gi')::jsonb`,
-      lastResponseBody: sql`regexp_replace(${d.lastResponseBody}, ${plain}, ${ERASED_TOMBSTONE}, 'gi')`,
+      payload: sql`regexp_replace(((${withoutFetcherPayload}) #- '{data,subject}' #- '{data,tags}' #- '{data,bounce,diagnostic_code}')::text, ${json}, ${jsonTombstone}, 'gi')::jsonb`,
+      lastResponseBody: null,
     })
     .where(
       and(
         inArray(d.endpointId, teamEndpoints),
-        or(sql`${d.payload}::text ~* ${json}`, sql`${d.lastResponseBody} ~* ${plain}`),
+        or(
+          inArray(d.emailId, teamEmailsMentioning),
+          sql`${d.payload}::text ~* ${json}`,
+          sql`${d.lastResponseBody} ~* ${plain}`,
+        ),
       ),
     )
     .returning({ id: d.id });
@@ -107,6 +123,11 @@ export async function eraseRecipient(
       cc: scrubJson(e.cc),
       bcc: scrubJson(e.bcc),
       replyTo: scrubJson(e.replyTo),
+      ...purgedEmailBodyColumns(new Date()),
+      subject: ERASED_TOMBSTONE,
+      headers: null,
+      tags: null,
+      latestStatus: sql`case when ${e.latestStatus} in ('queued','queued_quota') and ${e.sentAt} is null then 'canceled'::email_status else ${e.latestStatus} end`,
     })
     .where(and(eq(e.teamId, teamId), mentions))
     .returning({ id: e.id });

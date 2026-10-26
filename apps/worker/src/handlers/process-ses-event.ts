@@ -3,6 +3,7 @@ import {
   bumpHourlyUsage,
   DAY_MS,
   type EmailStatus,
+  ERASED_TOMBSTONE,
   emitSuppressionEvents,
   enqueueWebhookDeliveries,
   failedEmailExtras,
@@ -146,8 +147,32 @@ export async function processSesEvent(
   // effects would make a retry early-return and permanently drop them,
   // losing e.g. a hard-bounce suppression.
   const hooks = webhookBatch(opts.enqueueWebhookDelivery);
+  const sourceEmail = email;
   const applied = await db.transaction(async (tx) => {
     const txDb = tx as unknown as Db;
+    let email = sourceEmail;
+    // Contact locks precede the email lock, matching confirmation/erasure.
+    // Re-read after waiting: an erasure may have tombstoned the old snapshot.
+    await lockSuppressionContacts(txDb, email.teamId, [
+      ...email.to,
+      ...(email.cc ?? []),
+      ...(email.bcc ?? []),
+    ]);
+    const [fresh] = await txDb
+      .select({
+        from: schema.emails.from,
+        to: schema.emails.to,
+        cc: schema.emails.cc,
+        bcc: schema.emails.bcc,
+        subject: schema.emails.subject,
+        tags: schema.emails.tags,
+      })
+      .from(schema.emails)
+      .where(eq(schema.emails.id, email.id))
+      .for("update");
+    if (!fresh) return false;
+    email = { ...email, ...fresh };
+    const erased = email.subject === ERASED_TOMBSTONE;
     if (email.matchedByTag) {
       const [joined] = await txDb
         .update(schema.emails)
@@ -173,7 +198,7 @@ export async function processSesEvent(
         occurredAt: new Date(event.occurredAt),
         snsMessageId: opts.snsMessageId ?? null,
         bounceType: event.eventType === "Bounce" ? (event.bounce?.bounceType ?? null) : null,
-        data: event.data,
+        data: erased ? null : event.data,
       })
       .onConflictDoNothing()
       .returning({ id: schema.emailEvents.id });
@@ -202,7 +227,7 @@ export async function processSesEvent(
         email: { emailId: email.id, from: email.from, to: email.to, subject: email.subject },
         type: webhookType,
         occurredAt: new Date(event.occurredAt),
-        extras: webhookExtras(event),
+        extras: erased ? {} : webhookExtras(event),
         enqueue: hooks.collect,
       });
     }
@@ -250,12 +275,6 @@ export async function processSesEvent(
     );
     const own = (recipients: readonly string[]) =>
       recipients.filter((r) => ownRecipients.has(hashRecipient(r)));
-    if (event.eventType === "Bounce" || event.eventType === "Complaint")
-      await lockSuppressionContacts(txDb, email.teamId, [
-        ...email.to,
-        ...(email.cc ?? []),
-        ...(email.bcc ?? []),
-      ]);
     const toSuppress =
       event.eventType === "Bounce" && event.bounce
         ? (event.bounce.bounceType === "Permanent"

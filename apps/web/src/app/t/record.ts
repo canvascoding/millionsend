@@ -304,7 +304,7 @@ export async function recordEngagement(
       .where(eq(schema.emails.id, emailId))
       .limit(1)
       .for("update");
-    if (!email) return;
+    if (!email || email.subject === "[erased]") return;
     const facts: WebhookEmailFacts = {
       emailId: email.id,
       from: email.from,

@@ -1,4 +1,9 @@
-import { deriveTrackingKey, makeClickToken, makeOpenToken } from "@millionsend/core";
+import {
+  deriveTrackingKey,
+  eraseRecipient,
+  makeClickToken,
+  makeOpenToken,
+} from "@millionsend/core";
 import { type Db, schema } from "@millionsend/db";
 import {
   createTeam,
@@ -63,6 +68,26 @@ async function clickToken(emailId: string, url: string, key = secretKey): Promis
 // A phone's mail client: what a person's fetch looks like.
 const IPHONE =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148";
+
+it("old open and click tokens cannot create new engagement data after erasure", async () => {
+  const { emailId, teamId } = await seedEmail();
+  const open = makeOpenToken({ emailId, secretKey });
+  const click = await clickToken(emailId, "https://example.com/");
+  await eraseRecipient(db, teamId, "rcpt@example.com");
+  await openGet(
+    new Request(`https://links.example.com/t/o/${open}`, { headers: { "User-Agent": IPHONE } }),
+    { params: Promise.resolve({ token: open }) },
+  );
+  await clickGet(
+    new Request(`https://links.example.com/t/c/${click}`, { headers: { "User-Agent": IPHONE } }),
+    { params: Promise.resolve({ token: click }) },
+  );
+  const events = await db
+    .select()
+    .from(schema.emailEvents)
+    .where(eq(schema.emailEvents.emailId, emailId));
+  expect(events).toHaveLength(0);
+});
 
 function req(token: string, headers: Record<string, string> = { "user-agent": IPHONE }) {
   return [

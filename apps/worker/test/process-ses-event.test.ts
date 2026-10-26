@@ -1,4 +1,4 @@
-import { DAY_MS, hashRecipient } from "@millionsend/core";
+import { DAY_MS, eraseRecipient, hashRecipient } from "@millionsend/core";
 import type { Db } from "@millionsend/db";
 import { schema } from "@millionsend/db";
 import type { SerializedSesEvent } from "@millionsend/queue";
@@ -17,16 +17,45 @@ beforeAll(async () => {
 });
 afterAll(() => close());
 
+it("late provider events do not restore erased recipient data", async () => {
+  const erasedTeamId = await createTeam(db, "erased-late-team");
+  const emailId = await insertSentEmail(
+    "erased-late",
+    ["erased-late@example.com"],
+    null,
+    new Date(),
+    erasedTeamId,
+  );
+  await eraseRecipient(db, erasedTeamId, "erased-late@example.com");
+  await processSesEvent(
+    db,
+    makeEvent({
+      sesMessageId: "erased-late",
+      data: { delivery: { recipients: ["erased-late@example.com"] } },
+    }),
+    { snsMessageId: "erased-late-event" },
+  );
+  const [event] = await db
+    .select()
+    .from(schema.emailEvents)
+    .where(eq(schema.emailEvents.snsMessageId, "erased-late-event"));
+  expect(event?.data).toBeNull();
+  const [mail] = await db.select().from(schema.emails).where(eq(schema.emails.id, emailId));
+  expect(mail?.to).toEqual(["[erased]"]);
+  expect(mail?.latestStatus).toBe("delivered");
+});
+
 async function insertSentEmail(
   sesMessageId: string,
   to = ["r@example.com"],
   contactId: string | null = null,
   sentAt = new Date(),
+  ownerTeamId = teamId,
 ): Promise<string> {
   const [row] = await db
     .insert(schema.emails)
     .values({
-      teamId,
+      teamId: ownerTeamId,
       contactId,
       from: "a@acme.dev",
       to,
