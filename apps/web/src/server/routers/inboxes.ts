@@ -1,8 +1,7 @@
 import {
   abuseJudgeConfig,
-  EMAIL_METADATA_RETENTION_DAYS_DEFAULT,
-  EMAIL_RETENTION_DAYS_DEFAULT,
   isCloudDeployment,
+  RECEIVED_RETENTION_DAYS_DEFAULT,
   sharedInboxDomain,
 } from "@millionsend/config";
 import {
@@ -18,7 +17,6 @@ import {
   getDraft,
   getInbox,
   getInboxSafety,
-  getInstanceSettings,
   getThread,
   INBOX_KINDS,
   type InboxSafety,
@@ -44,6 +42,7 @@ import {
   type ThreadEmailWire,
   teamMemberEmails,
   teamSharedDomain,
+  teamUnreadThreads,
   updateDraft,
   updateInbox,
   updateInboxSafety,
@@ -317,20 +316,25 @@ function withoutContent<T extends { html: string | null; text: string | null }>(
 }
 
 export const inboxesRouter = router({
-  /** What the create dialog offers: the team's receiving domains, the shared domain, the plan's room. */
+  /** What the create dialog offers: the team's domains, the shared domain, the plan's room. */
   options: receivingProcedure.query(async ({ ctx }) => {
     const dm = schema.domains;
-    const domains = await ctx.db
-      .select({ id: dm.id, name: dm.name })
+    const rows = await ctx.db
+      .select({ id: dm.id, name: dm.name, status: dm.status, receiving: dm.receivingEnabled })
       .from(dm)
-      .where(
-        and(eq(dm.teamId, ctx.teamId), eq(dm.receivingEnabled, true), eq(dm.status, "verified")),
-      )
+      .where(eq(dm.teamId, ctx.teamId))
       .orderBy(dm.name);
+    const receives = (row: (typeof rows)[number]) => row.receiving && row.status === "verified";
     const shared = sharedInboxDomain();
     const subdomain = shared ? await teamSharedDomain(ctx.db, ctx.teamId) : null;
     return {
-      domains,
+      domains: rows.filter(receives).map(({ id, name }) => ({ id, name })),
+      // Every other domain too, verified ones first, with what each still
+      // needs: one missing from the picker reads as one inboxes can't use.
+      otherDomains: rows
+        .filter((row) => !receives(row))
+        .map(({ id, name, status }) => ({ id, name, status }))
+        .sort((a, b) => Number(b.status === "verified") - Number(a.status === "verified")),
       // The team's subdomain; the parent domain while its name review is pending.
       sharedDomain: shared ? (subdomain?.name ?? shared) : null,
       sharedSending: shared ? await sharedSending(ctx) : null,
@@ -384,6 +388,9 @@ export const inboxesRouter = router({
         overview: first ? await receivedOverview(ctx.db, ctx.teamId) : null,
       };
     }),
+
+  /** The sidebar's count: unread threads across the team's People inboxes. */
+  unread: receivingProcedure.query(({ ctx }) => teamUnreadThreads(ctx.db, ctx.teamId)),
 
   get: receivingProcedure.input(z.object({ id: z.uuid() })).query(async ({ ctx, input }) => {
     // An expired inbox stays here, read-only, until the hourly sweep deletes
@@ -558,24 +565,15 @@ export const inboxesRouter = router({
     const safety = await getInboxSafety(ctx.db, { teamId: ctx.teamId, inboxId: input.id });
     if (!safety) throw new TRPCError({ code: "NOT_FOUND" });
     const members = await teamMemberEmails(ctx.db, ctx.teamId);
-    const stored = await getInstanceSettings(ctx.db);
     return {
       safety,
       // forward_to may name these, besides the owner addresses.
       memberEmails: members.sort(),
-      // Bodies go on the first clock and whole rows on the second, so mail lasts the shorter.
-      retentionDays: Math.min(
-        effectiveSetting(
-          stored.emailRetentionDays,
-          process.env.EMAIL_RETENTION_DAYS,
-          EMAIL_RETENTION_DAYS_DEFAULT,
-        ).value,
-        effectiveSetting(
-          null,
-          process.env.EMAIL_METADATA_RETENTION_DAYS,
-          EMAIL_METADATA_RETENTION_DAYS_DEFAULT,
-        ).value,
-      ),
+      retentionDays: effectiveSetting(
+        null,
+        process.env.RECEIVED_RETENTION_DAYS,
+        RECEIVED_RETENTION_DAYS_DEFAULT,
+      ).value,
     };
   }),
 

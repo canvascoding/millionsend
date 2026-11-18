@@ -34,6 +34,7 @@ const standing = (over: Partial<TeamStandingRow> & { teamId: string }): TeamStan
   sent30d: 4_000,
   monitorRisk: null,
   monitorSamples: 0,
+  monitorAbuse: 1,
   ...over,
 });
 
@@ -133,6 +134,21 @@ describe("syncTeamFlags", () => {
       reason: "guardrail",
       openedAt: t1,
       detail: { guardrail: "paused", metric: "complaint", rate: 0.003 },
+    });
+
+    // The guardrail eases to a warning: the same row reads the new level.
+    expect(
+      await syncTeamFlags(
+        db,
+        [standing({ teamId, guardrail: "warning", complaintRate7d: 0.0006 })],
+        t2,
+      ),
+    ).toEqual({ opened: 0, cleared: 0 });
+    expect((await flagsOf(teamId))[0]).toMatchObject({
+      id: opened?.id,
+      reason: "guardrail",
+      openedAt: t1,
+      detail: { guardrail: "warning", metric: "complaint", rate: 0.0006 },
     });
 
     expect(await syncTeamFlags(db, [standing({ teamId })], t3)).toEqual({
@@ -394,13 +410,13 @@ describe("standings", () => {
 
 describe("the monitor trigger", () => {
   it("flags on the risk line after the rate triggers and before the score, honouring the setting", () => {
-    expect(flagTrigger(standing({ teamId: "m", monitorRisk: 0.5, monitorSamples: 22 }))).toEqual({
+    expect(flagTrigger(standing({ teamId: "m", monitorRisk: 0.85, monitorSamples: 22 }))).toEqual({
       reason: "monitor",
-      detail: { risk: 0.5, samples: 22 },
+      detail: { risk: 0.85, samples: 22 },
     });
-    expect(flagTrigger(standing({ teamId: "m", monitorRisk: 0.49 }))).toBeNull();
+    expect(flagTrigger(standing({ teamId: "m", monitorRisk: 0.84 }))).toBeNull();
     expect(
-      flagTrigger(standing({ teamId: "m", monitorRisk: 0.49 }), { monitorFlagRisk: 0.4 })?.reason,
+      flagTrigger(standing({ teamId: "m", monitorRisk: 0.84 }), { monitorFlagRisk: 0.4 })?.reason,
     ).toBe("monitor");
     expect(flagTrigger(standing({ teamId: "m", monitorRisk: 0.9, scoreTenths: 10 }))?.reason).toBe(
       "monitor",
@@ -408,5 +424,68 @@ describe("the monitor trigger", () => {
     expect(
       flagTrigger(standing({ teamId: "m", monitorRisk: 0.9, complaintRate7d: 0.01 }))?.reason,
     ).toBe("complaints");
+  });
+});
+
+describe("the monitor flag's evidence", () => {
+  it("wants an abuse verdict from the flag score beside the risk", () => {
+    expect(flagTrigger(standing({ teamId: "m", monitorRisk: 0.9, monitorAbuse: 0 }))).toBeNull();
+    expect(flagTrigger(standing({ teamId: "m", monitorRisk: 0.9, monitorAbuse: 2 }))?.reason).toBe(
+      "monitor",
+    );
+  });
+
+  it("is for opening the flag: an open one stands while the risk is over the line", async () => {
+    const teamId = await createTeam(db, "monitor-kept");
+    const open = async () =>
+      (await flagsOf(teamId)).filter((f) => f.status === "open").map((f) => f.reason);
+    await syncTeamFlags(db, [standing({ teamId, monitorRisk: 0.95 })], new Date(), []);
+    expect(await open()).toEqual(["monitor"]);
+    const quiet = standing({ teamId, monitorRisk: 0.9, monitorAbuse: 0 });
+    await syncTeamFlags(db, [quiet], new Date(), []);
+    expect(await open()).toEqual(["monitor"]);
+    await syncTeamFlags(db, [{ ...quiet, monitorRisk: 0.4 }], new Date(), []);
+    expect(await open()).toEqual([]);
+  });
+
+  it("counts the week's abuse verdicts from the flag score on the standing", async () => {
+    const teamId = await createTeam(db, "abuse-counted");
+    const now = new Date();
+    await db.insert(schema.usageCounters).values({ teamId, day: utcDay(now), sent: 10 });
+    await db.insert(schema.monitorSamples).values([
+      {
+        teamId,
+        kind: "first_sends",
+        status: "judged",
+        score: 60,
+        verdict: "clean",
+        createdAt: now,
+      },
+      {
+        teamId,
+        kind: "first_sends",
+        status: "judged",
+        score: 75,
+        verdict: "abuse",
+        createdAt: now,
+      },
+      {
+        teamId,
+        kind: "first_sends",
+        status: "judged",
+        score: 66,
+        verdict: "abuse",
+        createdAt: now,
+      },
+    ]);
+    const rows = await computeTeamStandings(db, now);
+    expect(rows.find((row) => row.teamId === teamId)).toMatchObject({
+      monitorSamples: 3,
+      monitorAbuse: 1,
+    });
+    expect(
+      (await computeTeamStandings(db, now, { flagScore: 65 })).find((row) => row.teamId === teamId)
+        ?.monitorAbuse,
+    ).toBe(2);
   });
 });

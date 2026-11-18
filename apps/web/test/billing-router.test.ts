@@ -8,6 +8,7 @@ import {
   type PlanRungKey,
   rungByKey,
   type SystemMailMessage,
+  utcDay,
 } from "@millionsend/core";
 import type { Db } from "@millionsend/db";
 import { schema } from "@millionsend/db";
@@ -328,6 +329,7 @@ describe("billing router", () => {
       planStatus: "none",
       currentPeriodEnd: null,
       quota: { kind: "day", plan: "free", limit: 100 },
+      pooled: false,
       overageEnabled: true,
       usage: { accepted: 0, reportedOverage: 0 },
       hasCustomer: false,
@@ -336,6 +338,20 @@ describe("billing router", () => {
       // No mail is received here, so no plan line counts inboxes.
       inboxes: null,
     });
+  });
+
+  it("status counts a Free pool's day and says the cap is shared, never naming its creator", async () => {
+    const teamId = await createTeam(db, "billing-pooled", { poolOwnerId: "u-billing-pool" });
+    await db
+      .insert(schema.freePoolUsage)
+      .values({ ownerId: "u-billing-pool", day: utcDay(), accepted: 64 });
+    const status = await callerFor(teamId, "member").billing.status();
+    expect(status).toMatchObject({
+      quota: { kind: "day", plan: "free", limit: 100 },
+      pooled: true,
+      usage: { accepted: 64, reportedOverage: 0 },
+    });
+    expect(JSON.stringify(status)).not.toContain("u-billing-pool");
   });
 
   it("status reports each plan's inbox cap and the team's count where mail is received", async () => {
@@ -759,39 +775,22 @@ describe("billing router", () => {
 });
 
 describe("a suspended or flagged team", () => {
-  /**
-   * Suspends the team as the operator console does, or opens a flag of that
-   * kind: one of the safety cron's abuse signals, or else an operator's call.
-   */
-  async function hold(
-    teamId: string,
-    by: "suspension" | "monitor" | "guardrail" | "complaints" | "manual" | "score" | "report",
-  ) {
+  /** Suspends the team as the operator console does, or opens an operator's flag of that kind. */
+  async function hold(teamId: string, by: "suspension" | "manual" | "score" | "report") {
     if (by === "suspension") {
       await db
         .update(schema.teams)
         .set({ suspendedAt: new Date(), suspensionReason: "phishing" })
         .where(eq(schema.teams.id, teamId));
     } else {
-      const cron = by === "monitor" || by === "guardrail" || by === "complaints";
-      await db
-        .insert(schema.teamFlags)
-        .values({ teamId, reason: by, openedBy: cron ? null : "op1" });
+      await db.insert(schema.teamFlags).values({ teamId, reason: by, openedBy: "op1" });
     }
   }
   const held = { code: "FORBIDDEN", message: "upgrades_held" };
 
   it("cannot start a checkout; status says so", async () => {
     // An operator's flag holds whatever its kind: a reopened score flag, a report.
-    for (const by of [
-      "suspension",
-      "monitor",
-      "guardrail",
-      "complaints",
-      "manual",
-      "score",
-      "report",
-    ] as const) {
+    for (const by of ["suspension", "manual", "score", "report"] as const) {
       const teamId = await createTeam(db, `held-${by}`);
       await hold(teamId, by);
       const owner = callerFor(teamId, "owner");
@@ -814,12 +813,16 @@ describe("a suspended or flagged team", () => {
     }
   });
 
-  it("the cron's own score or report flag, or a cleared flag, holds nothing", async () => {
+  it("an automatic flag of any kind, or a cleared flag, holds nothing", async () => {
     const flags = [
+      { reason: "monitor" },
+      { reason: "guardrail" },
+      { reason: "complaints" },
       { reason: "score" },
       { reason: "report" },
+      { reason: "brand" },
+      { reason: "linked" },
       { reason: "manual", openedBy: "op1", status: "cleared", clearedAt: new Date() },
-      { reason: "monitor", status: "cleared", clearedAt: new Date() },
     ] as const;
     for (const [i, flag] of flags.entries()) {
       const teamId = await createTeam(db, `flagged-${i}`);
@@ -828,9 +831,17 @@ describe("a suspended or flagged team", () => {
     }
   });
 
+  it("can buy while the monitor's flag is open", async () => {
+    const teamId = await createTeam(db, "monitor-flagged");
+    await db.insert(schema.teamFlags).values({ teamId, reason: "monitor" });
+    expect(await callerFor(teamId, "owner").billing.checkout({ rung: "starter" })).toEqual({
+      url: "https://checkout.stripe.com/c/cs_1",
+    });
+  });
+
   it("cannot move up or turn overage on", async () => {
     const teamId = await subscribedTeam("pro_100k");
-    await hold(teamId, "monitor");
+    await hold(teamId, "manual");
     const owner = callerFor(teamId, "owner");
     await expect(owner.billing.changePlan({ rung: "pro_200k" })).rejects.toMatchObject(held);
     await expect(owner.billing.changePlan({ rung: "scale_2_5m" })).rejects.toMatchObject(held);
@@ -852,7 +863,7 @@ describe("a suspended or flagged team", () => {
       .update(schema.teams)
       .set({ plan: "scale", planQuota: 500_000 })
       .where(eq(schema.teams.id, teamId));
-    await hold(teamId, "guardrail");
+    await hold(teamId, "report");
     await expect(
       callerFor(teamId, "owner").billing.changePlan({ rung: "scale_500k" }),
     ).rejects.toMatchObject(held);

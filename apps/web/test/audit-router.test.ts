@@ -107,6 +107,37 @@ describe("audit.list", () => {
     });
   });
 
+  it("shows the team a pause lift without the operator's reference and note", async () => {
+    const teamId = await createTeam(db, "acme");
+    await addMember(teamId, "alice", "owner");
+    // The row the console's Lift sending pause writes.
+    await db.insert(schema.auditLog).values({
+      teamId,
+      actorId: "user:op",
+      action: "team.sending_pause_lifted",
+      target: `team:${teamId}`,
+      data: {
+        name: "acme",
+        reference: "Ticket 1042",
+        note: "Fake sign-ups stopped",
+        since: "2026-08-13",
+        sent: 300,
+        hardBounces: 20,
+        notified: true,
+      },
+    });
+    const { items } = await callerFor("alice", teamId, "owner").audit.list({});
+    expect(items[0]?.data).toEqual({
+      name: "acme",
+      reference: null,
+      note: null,
+      since: "2026-08-13",
+      sent: 300,
+      hardBounces: 20,
+      notified: true,
+    });
+  });
+
   it("never lists trust & safety flags and shows the operator only as MillionSend; the console keeps both", async () => {
     // The instance operator is the first registered user, and no member of the team.
     await db
@@ -226,7 +257,7 @@ describe("audit.list", () => {
 
     // A run of certain verdicts on a new team: the monitor pauses its broadcasts.
     const quiet = { ...MONITOR_SETTING_DEFAULTS, autoPause: false };
-    for (let i = 0; i < 12; i += 1) await applyJudgedSample(db, quiet, { teamId, score: 100 });
+    for (let i = 0; i < 60; i += 1) await applyJudgedSample(db, quiet, { teamId, score: 100 });
     const paused = await applyJudgedSample(db, MONITOR_SETTING_DEFAULTS, { teamId, score: 95 });
     expect(paused.paused).toBe(true);
     await operator.console.monitor.resumeBroadcasts({ teamId });

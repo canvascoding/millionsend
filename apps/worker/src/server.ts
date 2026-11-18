@@ -23,6 +23,8 @@ import {
 } from "@millionsend/config";
 import {
   anyYoungLinkDomain,
+  backfillPoolOwners,
+  bookFreeBurst,
   committedDailyVolume,
   createDomainAgeResolver,
   createSharedNameReview,
@@ -40,8 +42,10 @@ import {
   hashRecipient,
   type InboxDeps,
   type InboxSendDeps,
+  linkDomainsAged,
   type MonitorDeps,
   markDomainAgeUnknown,
+  monitorFlagLine,
   monitorSettingsReader,
   ownerDomain,
   pacingHorizonDays,
@@ -53,6 +57,7 @@ import {
   purgeCampaignFingerprints,
   purgeExpiredIdempotencyKeys,
   purgeTrashedThreads,
+  purgeUnmatchedSesEvents,
   type QueuedWebhookDelivery,
   reconcilePendingScreens,
   recordDomainAge,
@@ -95,6 +100,7 @@ import {
   purgeExpiredReceivedMetadata,
   purgeExpiredSessions,
   purgeInboxData,
+  purgeStaleFreePoolUsage,
   purgeStaleHourlyUsage,
   reapStaleTrackingSubdomains,
   reapUnverifiedDomains,
@@ -109,6 +115,7 @@ import { drainWebhookEndpoint } from "./handlers/deliver-webhook.js";
 import { forwardToOwners } from "./handlers/inbox-forward.js";
 import { runInstanceProbes } from "./handlers/instance-probes.js";
 import { alertLinkedTeams } from "./handlers/linkage-alerts.js";
+import { sendMonitorDigest } from "./handlers/monitor-digest.js";
 import { runMonitorHealth } from "./handlers/monitor-health.js";
 import { reportPlanMove, sweepNotifications } from "./handlers/notify.js";
 import { runPlatformBreaker } from "./handlers/platform-breaker.js";
@@ -253,7 +260,8 @@ const sendControls = createRegionSendControls({
   reserve: async () =>
     (await getInstanceSettings(db)).sesTransactionalReserve ?? env.SES_TRANSACTIONAL_RESERVE,
   counts: () => regionBulkCounts(db),
-  paused: async () => new Set((await pausedRegions(db)).map((p) => p.region)),
+  paused: async () =>
+    new Map((await pausedRegions(db)).map((p) => [p.region, p.heldTeams && new Set(p.heldTeams)])),
   initialRate: env.SES_MAX_SEND_RATE,
   replicas: env.WORKER_REPLICAS,
 });
@@ -290,6 +298,10 @@ const enqueueSends: EnqueueEmailSends = async (batch) => {
 };
 const enqueueSend = (emailId: string, startAfter?: Date, priority?: EmailSendPriority) =>
   enqueueSends([{ emailId, startAfter, priority }]);
+// A team whose standing changed: the tenant.status job brings its SES tenant in line.
+const syncTenant = async (teamId: string): Promise<void> => {
+  await queue.send("tenant.status", { teamId }, { dedupeKey: teamId });
+};
 
 // Account mail rides the pipeline, so the mailer needs the queue it enqueues into.
 const mailer = createSystemMailer({ db, keyring, enqueueSend });
@@ -430,6 +442,7 @@ await queue.scheduleCrons({
   "retention.purge": async () => {
     const purged = await purgeExpiredEmailBodies(db, {
       defaultRetentionDays: env.EMAIL_RETENTION_DAYS,
+      threadRetentionDays: env.RECEIVED_RETENTION_DAYS,
     });
     const requests = await purgeExpiredApiRequests(db, {
       defaultRetentionDays: env.EMAIL_RETENTION_DAYS,
@@ -439,19 +452,20 @@ await queue.scheduleCrons({
     });
     const metadata = await purgeExpiredEmailMetadata(db, {
       retentionDays: metadataRetentionDays,
+      threadRetentionDays: env.RECEIVED_RETENTION_DAYS,
       deliveryRetentionDays: env.WEBHOOK_DELIVERY_RETENTION_DAYS,
     });
     const receivedPurged = await purgeExpiredReceivedContent(db, {
-      defaultRetentionDays: env.EMAIL_RETENTION_DAYS,
+      retentionDays: env.RECEIVED_RETENTION_DAYS,
     });
     const receivedDeleted = await purgeExpiredReceivedMetadata(db, {
-      retentionDays: metadataRetentionDays,
+      retentionDays: env.RECEIVED_RETENTION_DAYS,
     });
     // After the received metadata purge, whose deletes cascade to memberships.
     const now = new Date();
     const inboxData = await purgeInboxData(db, {
-      contentDays: (await getInstanceSettings(db)).emailRetentionDays ?? env.EMAIL_RETENTION_DAYS,
-      metadataDays: metadataRetentionDays,
+      contentDays: env.RECEIVED_RETENTION_DAYS,
+      metadataDays: env.RECEIVED_RETENTION_DAYS,
       now,
     });
     const inboxesExpired = await expireInboxes(db, inboxDeps, now);
@@ -459,11 +473,13 @@ await queue.scheduleCrons({
     const draftsExpired = await expireDrafts(db, inboxSendDeps, now);
     const sessions = await purgeExpiredSessions(db);
     const hourlyUsage = await purgeStaleHourlyUsage(db);
+    const freePoolUsage = await purgeStaleFreePoolUsage(db);
     const stripeEvents = await purgeStripeEvents(db);
     const probes = await pruneProbes(db);
     const monitorSamples = await pruneMonitorSamples(db);
     const signups = await purgeAccountSignups(db);
     const fingerprints = await purgeCampaignFingerprints(db);
+    const unmatchedSesEvents = await purgeUnmatchedSesEvents(db, now);
     // The console's retention row: how many bodies the last run purged.
     await recordProbes(db, [{ probe: "retention_purged", value: purged, ok: true }]);
     const counts = {
@@ -471,6 +487,7 @@ await queue.scheduleCrons({
       probes,
       monitorSamples,
       hourlyUsage,
+      freePoolUsage,
       apiRequests: requests,
       events: stripped.events,
       deliveries: stripped.deliveries,
@@ -486,6 +503,7 @@ await queue.scheduleCrons({
       sessions,
       signups,
       fingerprints,
+      unmatchedSesEvents,
       stripeEvents,
     };
     if (Object.values(counts).some((n) => n > 0)) {
@@ -559,12 +577,17 @@ await queue.scheduleCrons({
     await runPlatformBreaker(db, {
       mailer,
       appBaseUrl: env.APP_BASE_URL,
+      isCloud: env.IS_CLOUD,
+      defaultRegion,
+      syncTenant,
       ses: {
         regions,
         complaintRate: async (region) => {
           const client = reputationClients.get(region);
           return client ? getSesComplaintRate(client) : null;
         },
+        enforcementStatus: async (region) =>
+          (await getAccountOverview(accountClientFor(region))).enforcementStatus,
         loggedAt: sesUnreadableLoggedAt,
       },
     });
@@ -579,9 +602,10 @@ await queue.scheduleCrons({
     });
   },
   "safety.flags": async () => {
-    // With the judge off a stored risk opens nothing: the line is unreachable.
+    const settings = judge ? await monitorSettings() : null;
     const result = await runSafetyFlags(db, {
-      monitorFlagRisk: judge ? (await monitorSettings()).flagRisk : Number.POSITIVE_INFINITY,
+      monitorFlagRisk: monitorFlagLine(settings),
+      monitorFlagScore: settings?.flagScore,
     });
     if (result.opened > 0 || result.cleared > 0 || result.graduated > 0) {
       console.log(
@@ -593,6 +617,10 @@ await queue.scheduleCrons({
       keyring: () => keyring,
       cards: stripe ? (customerId) => cardFingerprints(stripe, customerId) : undefined,
     });
+  },
+  "monitor.digest": async () => {
+    const teams = await sendMonitorDigest(db, { mailer, appBaseUrl: env.APP_BASE_URL });
+    if (teams > 0) console.log(`monitor.digest: teams=${teams}`);
   },
   "monitor.health": async () => {
     const result = await runMonitorHealth(db, {
@@ -709,6 +737,15 @@ backfillSharedSubdomains().catch((err) => {
   console.warn("shared.subdomain at boot failed; the 15-minute sweep covers it", err);
 });
 
+// Teams created before their creator was recorded join their Free pool.
+backfillPoolOwners(db, env.IS_CLOUD)
+  .then((filled) => {
+    if (filled > 0) console.log(`teams.pool_owner: filled=${filled}`);
+  })
+  .catch((err) => {
+    console.warn("teams.pool_owner at boot failed; the next boot tries again", err);
+  });
+
 // Retries exhausted: the row must not stay "queued" for the reconcile sweep
 // to resurrect forever.
 await queue.workDeadLetter("email.send", async ({ emailId }) => {
@@ -767,12 +804,14 @@ await queue.work(
       {
         keyring,
         ses,
+        isCloud: env.IS_CLOUD,
         defaultConfigurationSet: env.SES_CONFIGURATION_SET,
         onboardingEmailFrom: env.ONBOARDING_EMAIL_FROM,
         settings: monitorSettings,
         sharedTenant,
         throttle: (region) => sendControls.throttle(region),
         reschedule: (emailId, at, priority) => enqueueSend(emailId, at, priority),
+        ...(env.IS_CLOUD ? { freeBurst: bookFreeBurst } : {}),
         sesQuota: sendControls,
         enqueueWebhookDelivery: enqueueWebhook,
         tracking,
@@ -830,14 +869,14 @@ await queue.work(
         timeoutMs: judgeConfig?.timeoutMs,
         mailer,
         appBaseUrl: env.APP_BASE_URL,
-        syncTenant: async (teamId) => {
-          await queue.send("tenant.status", { teamId }, { dedupeKey: teamId });
-        },
+        syncTenant,
         enqueueSend: (emailId, priority) => enqueueSend(emailId, undefined, priority),
         enqueueBroadcast: (broadcastId) => enqueueBroadcast(broadcastId),
         platformDomains,
         linkDomainYoung: (domains, at) =>
           anyYoungLinkDomain(db, domainAge, domains, at, { budgetMs: LINK_AGE_BUDGET_MS }),
+        linkDomainAged: (domains, at) =>
+          linkDomainsAged(db, domainAge, domains, at, { budgetMs: LINK_AGE_BUDGET_MS }),
         media: { vision },
       },
       { sampleId },

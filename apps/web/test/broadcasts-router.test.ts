@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   DAY_MS,
   defaultSafety,
@@ -525,9 +526,17 @@ describe("broadcasts.send platform breaker", () => {
     expect(enqueued).toEqual([]);
     expect((await broadcastRow(id))?.status).toBe("draft");
 
-    await db.delete(schema.regionBreakers);
+    // A pause the complaints tripped holds only the teams it names.
+    await db
+      .update(schema.regionBreakers)
+      .set({ manualReason: null, heldTeams: [randomUUID()] })
+      .where(eq(schema.regionBreakers.region, "us-east-1"));
     await caller.broadcasts.send({ id });
     expect((await broadcastRow(id))?.status).toBe("scheduled");
+    await db.update(schema.regionBreakers).set({ heldTeams: [teamId] });
+    const second = await caller.broadcasts.create(DRAFT_INPUT);
+    await expect(caller.broadcasts.send({ id: second.id })).rejects.toMatchObject(refusal);
+    await db.delete(schema.regionBreakers);
   });
 });
 
@@ -769,7 +778,10 @@ describe("broadcasts.sendTest", () => {
         html: "<p>x</p>",
         text: null,
       }),
-    ).rejects.toMatchObject({ code: "TOO_MANY_REQUESTS" });
+    ).rejects.toMatchObject({
+      code: "TOO_MANY_REQUESTS",
+      cause: expect.objectContaining({ seconds: expect.any(Number) }),
+    });
   });
 
   it("says a test the new domain limit holds is queued, and any other hold only that it waits", async () => {
@@ -981,6 +993,17 @@ describe("paced sends", () => {
       .values({ registrableDomain: "example.com", day: utcDay(), accepted: used });
   }
 
+  /** The new domain limit resets at 00:00 UTC; a run crossing it would see a fresh day. */
+  function pinMidday() {
+    const midday = new Date();
+    midday.setUTCHours(12, 0, 0, 0);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(midday);
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+  }
+
   const nextMidnight = () => {
     const at = new Date();
     at.setUTCHours(24, 0, 0, 0);
@@ -988,6 +1011,7 @@ describe("paced sends", () => {
   };
 
   it("sendPlan plans a young domain's send under its new domain limit, never refusing it", async () => {
+    pinMidday();
     stubAccount({ max24h: 100_000, sentLast24h: 0, maxSendRate: 14 });
     const teamId = await createTeam(db, "team-a");
     await seedVerifiedDomain(teamId);
@@ -1011,6 +1035,7 @@ describe("paced sends", () => {
   });
 
   it("a send in progress from a young domain finishes after the limit's reset", async () => {
+    pinMidday();
     stubAccount({ max24h: 100_000, sentLast24h: 0, maxSendRate: 14 });
     const teamId = await createTeam(db, "team-a");
     const { caller, id } = await seedSendingBroadcast(teamId);
@@ -1136,6 +1161,12 @@ describe("paced sends", () => {
     });
     expect((await caller.broadcasts.get({ id: due })).held).toBe(true);
     expect((await caller.broadcasts.get({ id: elsewhere })).held).toBe(false);
+
+    // A pause the complaints tripped holds only the teams it names.
+    await db.update(schema.regionBreakers).set({ heldTeams: [randomUUID()] });
+    expect((await caller.broadcasts.get({ id: due })).held).toBe(false);
+    await db.update(schema.regionBreakers).set({ heldTeams: [teamId] });
+    expect((await caller.broadcasts.get({ id: due })).held).toBe(true);
 
     await db.update(schema.regionBreakers).set({ paused: false });
     const released = await caller.broadcasts.get({ id: sending });

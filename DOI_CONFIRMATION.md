@@ -28,8 +28,12 @@ The storefront backend uses the guarded confirmation endpoint instead.
 Its local evidence keeps each consent request and exact notice separately,
 including the earlier withdrawal and the later fresh mailbox confirmation.
 
-The fork includes upstream main plus these changes. Its nullable `confirmation`
-JSONB column was introduced by migration `0063_lazy_scarecrow`; resubscription
-adds metadata fields without another SQL migration. Tests exercise all block
+The fork's nullable `confirmation` JSONB column was originally added by
+`0063_lazy_scarecrow`. On the v0.30.1 upgrade, Drizzle applies upstream
+migrations `0063` through `0069`, then
+`0070_fork_newsletter_confirmation` creates the column if it is missing.
+Existing deployments keep their confirmation data and the historical migration
+entry in PostgreSQL. Fresh installs get the same column from `0070`.
+Resubscription metadata lives in the same JSONB column. Tests exercise all block
 origins, profile preservation, tenant/key scope, idempotency, renewal, expiry,
 withdrawal, concurrent suppression writes and real PostgreSQL/SMTP delivery.

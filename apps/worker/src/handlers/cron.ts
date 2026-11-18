@@ -12,6 +12,7 @@ import {
   endQueuedEmails,
   failQueuedEmailsForDomain,
   fetchDeliverabilityHealth,
+  freeFuseTripped,
   getInstanceSettings,
   isIdentitySharedByOtherDomains,
   nextUtcDayStart,
@@ -187,7 +188,7 @@ export interface DrainDeps {
         regions: readonly string[];
         exhausted(region: string): boolean;
         room?(region: string): number;
-        paused?(region: string): boolean;
+        paused?(region: string, teamId: string): boolean;
         recount?(): Promise<void>;
         noteBulkQueued?(region: string, n: number): void;
       }
@@ -226,6 +227,8 @@ const DRAIN_PAGE = 500;
 /** What one drain run carries between its passes. */
 interface DrainRun {
   now: Date;
+  /** Park reasons the run releases nothing of: the operator's, and the Free fuse's while it is tripped. */
+  heldReasons: (typeof schema.emailParkReasonEnum.enumValues)[number][];
   /** Teams found at their cap leave every later page query. */
   heldTeams: Set<string>;
   /** Teams already asked whether the deliverability pause holds them. */
@@ -281,6 +284,12 @@ export async function drainQuotaParked(db: Db, deps: DrainDeps): Promise<DrainRe
   const held = regions.filter((region) => deps.sesQuota?.exhausted(region));
   const run: DrainRun = {
     now,
+    // The Free fuse's rows wait only while it is tripped: its release frees
+    // them, and a row a send parked on it as the release landed goes with
+    // the next run.
+    heldReasons: (await freeFuseTripped(db))
+      ? [...OPERATOR_PARK_REASONS, "fuse"]
+      : [...OPERATOR_PARK_REASONS],
     heldTeams: new Set(),
     checkedTeams: new Set(),
     pausedTeams: new Set(),
@@ -325,7 +334,9 @@ export async function drainQuotaParked(db: Db, deps: DrainDeps): Promise<DrainRe
           // Sent rows too: a broadcast completed before the status stayed
           // sending until its last row may still hold plan-parked rows.
           inArray(b.status, ["sending", "sent"]),
-          sql`exists (select 1 from emails e where e.broadcast_id = broadcasts.id and e.latest_status = 'queued_quota')`,
+          // A broadcast whose parked rows all wait for an operator or the
+          // tripped fuse would take a slice and release nothing.
+          sql`exists (select 1 from emails e where e.broadcast_id = broadcasts.id and e.latest_status = 'queued_quota' and (e.park_reason is null or e.park_reason not in ${run.heldReasons}))`,
         ),
       )
       .orderBy(asc(b.scheduledAt), asc(b.createdAt), asc(b.id));
@@ -334,7 +345,10 @@ export async function drainQuotaParked(db: Db, deps: DrainDeps): Promise<DrainRe
     const eligible: { id: string; teamId: string; domainId: string | null; region: string }[] = [];
     for (const broadcast of waiting) {
       const region = (await parkedRegion(db, broadcast.id)) ?? regions[0] ?? "";
-      if (deps.sesQuota && (deps.sesQuota.paused?.(region) || deps.sesQuota.exhausted(region))) {
+      if (
+        deps.sesQuota &&
+        (deps.sesQuota.paused?.(region, broadcast.teamId) || deps.sesQuota.exhausted(region))
+      ) {
         continue;
       }
       if ((deps.sesQuota?.room?.(region) ?? Number.POSITIVE_INFINITY) <= 0) continue;
@@ -459,8 +473,9 @@ async function releaseParkedRows(
             opts.where,
             pass.where,
             // The operator's holds: a suspended team releases nothing, a paused
-            // team releases only its transactional rows, and what screening
-            // parked waits for the review list.
+            // team releases only its transactional rows, what screening parked
+            // waits for the review list and what the Free fuse parked waits
+            // while it is tripped.
             isNull(schema.teams.suspendedAt),
             or(
               isNull(schema.emails.broadcastId),
@@ -468,7 +483,7 @@ async function releaseParkedRows(
             ),
             or(
               isNull(schema.emails.parkReason),
-              notInArray(schema.emails.parkReason, [...OPERATOR_PARK_REASONS]),
+              notInArray(schema.emails.parkReason, run.heldReasons),
             ),
             // A row due on a later UTC day is charged on that day, its warm-up
             // included, when it comes: reserved against today, days of the cap
@@ -801,13 +816,15 @@ export async function reconcileStalledSends(
     }),
   );
   await hooks.flush();
-  // A row scheduled for later is waiting by design, not lost; its job is due
-  // with it and would only be re-enqueued every sweep until then.
+  // A row scheduled for later, or booked a later slot by its Free pool's
+  // burst allowance, is waiting by design, not lost; its job is due with it
+  // and would only be re-enqueued every sweep until then.
   const stalled = and(
     eq(e.latestStatus, "queued"),
     isNull(e.sentAt),
     lt(e.createdAt, staleBefore),
     or(isNull(e.scheduledAt), lte(e.scheduledAt, now)),
+    or(isNull(e.freeBurstAt), lte(e.freeBurstAt, now)),
   );
   // Keyset pages over (createdAt, id), capped per run, one enqueue per page.
   let cursorId: string | undefined;
@@ -838,14 +855,17 @@ export async function reconcileStalledSends(
 /**
  * Nulls body columns past the retention window and stamps bodyPurgedAt;
  * metadata, events, and aggregates keep their own lifecycles. Emails whose
- * scheduled send is still in the future keep their body (the send needs it);
- * everything else past the cutoff is purged unconditionally — retention is
- * a compliance promise, so even a zombie still-queued email loses its body
- * (the send handler then marks it failed on the missing body).
+ * scheduled send, or the slot their Free pool's burst allowance booked, is
+ * still in the window keep their body (the send needs it); everything else
+ * past the cutoff is purged unconditionally — retention is a compliance
+ * promise, so even a zombie still-queued email loses its body (the send
+ * handler then marks it failed on the missing body).
+ * Mail sent in an inbox thread follows `threadRetentionDays` instead, so a
+ * thread keeps its replies as long as its received side.
  */
 export async function purgeExpiredEmailBodies(
   db: Db,
-  params: { defaultRetentionDays: number; now?: Date },
+  params: { defaultRetentionDays: number; threadRetentionDays?: number; now?: Date },
 ): Promise<number> {
   // Read the instance setting fresh each run so a Settings → Instance change
   // applies to the next purge without a worker restart; NULL falls back to
@@ -854,54 +874,60 @@ export async function purgeExpiredEmailBodies(
   const retentionDays = emailRetentionDays ?? params.defaultRetentionDays;
   const now = params.now ?? new Date();
   const cutoff = new Date(now.getTime() - retentionDays * DAY_MS);
+  const threadCutoff = new Date(
+    now.getTime() - (params.threadRetentionDays ?? retentionDays) * DAY_MS,
+  );
   const e = schema.emails;
   // Batched like the metadata purge: a backlog (a shortened retention, a
   // worker outage) must not become one statement returning millions of ids.
   let purged = 0;
-  for (;;) {
-    const batch = affectedRows(
-      await db
-        .update(e)
-        .set(purgedEmailBodyColumns(now))
-        .where(
-          inArray(
-            e.id,
-            db
-              .select({ id: e.id })
-              .from(e)
-              .where(
-                and(
-                  lt(e.createdAt, cutoff),
-                  isNull(e.bodyPurgedAt),
-                  or(isNull(e.scheduledAt), lt(e.scheduledAt, cutoff)),
-                ),
-              )
-              .orderBy(asc(e.createdAt))
-              .limit(PURGE_BATCH),
+  for (const [threaded, before] of [
+    [false, cutoff],
+    [true, threadCutoff],
+  ] as const) {
+    for (;;) {
+      const batch = affectedRows(
+        await db
+          .update(e)
+          .set(purgedEmailBodyColumns(now))
+          .where(
+            inArray(
+              e.id,
+              db
+                .select({ id: e.id })
+                .from(e)
+                .where(
+                  and(
+                    emailPastRetention(threaded, before),
+                    isNull(e.bodyPurgedAt),
+                    or(isNull(e.freeBurstAt), lt(e.freeBurstAt, before)),
+                  ),
+                )
+                .orderBy(asc(e.createdAt))
+                .limit(PURGE_BATCH),
+            ),
           ),
-        ),
-    );
-    purged += batch;
-    if (batch < PURGE_BATCH) break;
+      );
+      purged += batch;
+      if (batch < PURGE_BATCH) break;
+    }
   }
   return purged;
 }
 
 /**
- * Received mail on the content clock (the email bodies' window: instance
- * setting > env default): the sealed raw message and attachment list go,
+ * Received mail on the content clock (RECEIVED_RETENTION_DAYS, not the sent
+ * bodies' window): the sealed raw message and attachment list go,
  * contentPurgedAt is stamped, and the metadata row stays for its own window.
  * After this a received email reads `raw: null`, which is what makes Resend's
  * forward() report the raw content as unavailable.
  */
 export async function purgeExpiredReceivedContent(
   db: Db,
-  params: { defaultRetentionDays: number; now?: Date },
+  params: { retentionDays: number; now?: Date },
 ): Promise<number> {
-  const { emailRetentionDays } = await getInstanceSettings(db);
-  const retentionDays = emailRetentionDays ?? params.defaultRetentionDays;
   const now = params.now ?? new Date();
-  const cutoff = new Date(now.getTime() - retentionDays * DAY_MS);
+  const cutoff = new Date(now.getTime() - params.retentionDays * DAY_MS);
   const r = schema.receivedEmails;
   let purged = 0;
   for (;;) {
@@ -935,7 +961,7 @@ export async function purgeExpiredReceivedContent(
   return purged;
 }
 
-/** Received mail on the metadata clock: whole rows past EMAIL_METADATA_RETENTION_DAYS, in batches. */
+/** Received mail on the metadata clock: whole rows past RECEIVED_RETENTION_DAYS, in batches. */
 export async function purgeExpiredReceivedMetadata(
   db: Db,
   params: { retentionDays: number; now?: Date },
@@ -1309,19 +1335,43 @@ export async function reapStaleTrackingSubdomains(
 const PURGE_BATCH = 1000;
 
 /**
+ * An email row past its window on one clock: inbox-thread mail (threaded) or
+ * the rest, each looped separately so its scan walks a partial created_at
+ * index holding only rows on that clock, never stepping over the rows the
+ * other clock keeps. Future-scheduled rows are kept on the same clock.
+ */
+function emailPastRetention(threaded: boolean, before: Date) {
+  const e = schema.emails;
+  return and(
+    threaded ? isNotNull(e.threadId) : isNull(e.threadId),
+    lt(e.createdAt, before),
+    or(isNull(e.scheduledAt), lt(e.scheduledAt, before)),
+  );
+}
+
+/**
  * Metadata retention: whole email rows (recipients, subject, headers, tags —
  * events cascade with them) past the metadata window are deleted in batches.
  * Webhook deliveries are a log with their own, shorter window
  * (`deliveryRetentionDays`), purged here on the same schedule.
- * Future-scheduled rows are kept like the body purge does. Env-only
- * windows; no instance setting overrides them.
+ * Future-scheduled rows are kept like the body purge does, and inbox-thread
+ * mail follows `threadRetentionDays`. Env-only windows; no instance setting
+ * overrides them.
  */
 export async function purgeExpiredEmailMetadata(
   db: Db,
-  params: { retentionDays: number; deliveryRetentionDays?: number; now?: Date },
+  params: {
+    retentionDays: number;
+    threadRetentionDays?: number;
+    deliveryRetentionDays?: number;
+    now?: Date;
+  },
 ): Promise<{ emails: number; deliveries: number; broadcasts: number }> {
   const now = params.now ?? new Date();
   const cutoff = new Date(now.getTime() - params.retentionDays * DAY_MS);
+  const threadCutoff = new Date(
+    now.getTime() - (params.threadRetentionDays ?? params.retentionDays) * DAY_MS,
+  );
   const deliveryCutoff = new Date(
     now.getTime() - (params.deliveryRetentionDays ?? params.retentionDays) * DAY_MS,
   );
@@ -1357,24 +1407,29 @@ export async function purgeExpiredEmailMetadata(
   `),
   );
   let emails = 0;
-  for (;;) {
-    const batch = affectedRows(
-      await db.delete(e).where(
-        inArray(
-          e.id,
-          db
-            .select({ id: e.id })
-            .from(e)
-            .where(
-              and(lt(e.createdAt, cutoff), or(isNull(e.scheduledAt), lt(e.scheduledAt, cutoff))),
-            )
-            .orderBy(asc(e.createdAt))
-            .limit(PURGE_BATCH),
-        ),
-      ),
-    );
-    emails += batch;
-    if (batch < PURGE_BATCH) break;
+  for (const [threaded, before] of [
+    [false, cutoff],
+    [true, threadCutoff],
+  ] as const) {
+    for (;;) {
+      const batch = affectedRows(
+        await db
+          .delete(e)
+          .where(
+            inArray(
+              e.id,
+              db
+                .select({ id: e.id })
+                .from(e)
+                .where(emailPastRetention(threaded, before))
+                .orderBy(asc(e.createdAt))
+                .limit(PURGE_BATCH),
+            ),
+          ),
+      );
+      emails += batch;
+      if (batch < PURGE_BATCH) break;
+    }
   }
   const d = schema.webhookDeliveries;
   let deliveries = 0;
@@ -1514,6 +1569,15 @@ export async function purgeStaleHourlyUsage(db: Db, now = new Date()): Promise<n
     if (batch < PURGE_BATCH) break;
   }
   return purged;
+}
+
+/**
+ * A Free pool's day counters feed its daily cap and the guardrail's 7-day
+ * window only; 35 days keeps a margin past both. One row per pool and day.
+ */
+export async function purgeStaleFreePoolUsage(db: Db, now = new Date()): Promise<number> {
+  const p = schema.freePoolUsage;
+  return affectedRows(await db.delete(p).where(lt(p.day, utcDay(now.getTime() - 35 * DAY_MS))));
 }
 
 export async function purgeExpiredSessions(db: Db, now = new Date()): Promise<number> {

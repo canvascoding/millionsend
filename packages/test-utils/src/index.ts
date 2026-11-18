@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import type { Db } from "@millionsend/db";
 import { schema } from "@millionsend/db";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/pglite";
 import { LinkifyIt } from "linkify-it";
 import { find } from "linkifyjs";
@@ -36,16 +37,17 @@ export async function createTestDb(): Promise<{ db: Db; close: () => Promise<voi
 /**
  * A team named after its slug; with `sharedInboxDomain`, also its unlocked
  * subdomain label `<slug>.<sharedInboxDomain>`, which a real team gets when
- * it is created.
+ * it is created. With `poolOwnerId`, the creator Cloud records, which puts a
+ * Free team in that user's Free pool.
  */
 export async function createTeam(
   db: Db,
   slug = "acme",
-  opts: { sharedInboxDomain?: string | undefined } = {},
+  opts: { sharedInboxDomain?: string | undefined; poolOwnerId?: string | undefined } = {},
 ): Promise<string> {
   const [team] = await db
     .insert(schema.teams)
-    .values({ name: slug, slug })
+    .values({ name: slug, slug, poolOwnerId: opts.poolOwnerId ?? null })
     .returning({ id: schema.teams.id });
   if (!team) throw new Error("team insert failed");
   if (opts.sharedInboxDomain) {
@@ -54,6 +56,15 @@ export async function createTeam(
       .values({ teamId: team.id, name: `${slug}.${opts.sharedInboxDomain}` });
   }
   return team.id;
+}
+
+/** The monitor notices waiting for a team's next operator digest, kind → count. */
+export async function digestCounts(db: Db, teamId: string): Promise<Record<string, number>> {
+  const rows = await db
+    .select()
+    .from(schema.monitorDigest)
+    .where(eq(schema.monitorDigest.teamId, teamId));
+  return Object.fromEntries(rows.map((row) => [row.kind, row.count]));
 }
 
 /**

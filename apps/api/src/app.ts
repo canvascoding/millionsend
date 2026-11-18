@@ -100,6 +100,7 @@ import {
   SHARED_REFUSALS,
   scoreBand,
   secondsToNextUtcDay,
+  secondsUntil,
   segmentContactsWhere,
   segmentFilterSchema,
   senderDomain,
@@ -451,6 +452,7 @@ function acceptRejection(result: Exclude<AcceptEmailResult, { ok: true }>): {
       return {
         status: 429 as const,
         body: errorBody(429, "monthly_quota_exceeded", monthlyQuotaMessage(result)),
+        retryAfterSec: secondsUntil(result.periodEnd),
       };
     case "attachments_too_large":
       return {
@@ -2996,10 +2998,11 @@ function registerBroadcastRoutes(app: OpenAPIHono<Env>, deps: ApiDeps): void {
     if (keyForbidsSendingDomain(auth, domain.domainId)) {
       return fail(403, "restricted_api_key", RESTRICTED_DOMAIN_MESSAGE);
     }
-    // Platform breaker or the operator's hold on this SES region: broadcasts
-    // wait; /emails is deliberately not gated by it. The caller is never
-    // told why: the platform's rates are not the customer's to see.
-    if (await regionPause(db, domain.region)) {
+    // Platform breaker or the operator's hold on this SES region, when it
+    // holds this team's broadcasts: they wait; /emails is deliberately not
+    // gated by it. The caller is never told why: the platform's rates are
+    // not the customer's to see.
+    if (await regionPause(db, domain.region, auth.teamId)) {
       return fail(
         403,
         "broadcasts_paused",
@@ -4688,6 +4691,7 @@ export function createApi(deps: ApiDeps): OpenAPIHono<Env> {
         count: units,
         limit: quota.kind === "day" ? quota.limit : null,
         hardLimit: quota.dailyCeiling ?? null,
+        pool: quota.kind === "day" ? quota.pool : undefined,
         day: utcDay(after),
         at: after,
       });

@@ -6,10 +6,13 @@ import {
   buildJudgeBlock,
   claimNotification,
   clearDestinations,
+  clientIdentitySite,
+  DESTINATION_REVOKE_SCORE,
   decryptEmailBody,
   destinationVerdictParks,
   type EmailAttachment,
   isHoldVerdict,
+  isLocalOnlyMail,
   isPlatformLinkVerdict,
   isSharedInboxSender,
   type JudgeBlockInput,
@@ -19,18 +22,20 @@ import {
   type MediaIssue,
   type MonitorSettings,
   type MonitorTier,
+  mailCarriesPix,
   mediaParks,
   opaqueFacts,
   openAttachments,
   parseSingleSender,
   revokeDestinations,
   SCREEN_JUDGE_TIMEOUT_MS,
-  screeningTier,
+  screeningTeam,
   sendingDomainYoung,
   spareWaitingSamples,
   teamDestinationStanding,
   teamMonitorOverview,
   teamMonitorRow,
+  teamOwnDomains,
   UNNAMED_ATTACHMENT,
   utcDay,
   type VerdictOutcome,
@@ -47,6 +52,7 @@ import {
   saveMediaReview,
 } from "../media/read.js";
 import { mailOperator, type SystemMailer } from "../system-mail.js";
+import { noteForDigest } from "./monitor-digest.js";
 
 export interface JudgeDeps {
   /** Null when the monitor is off: every sample is recorded unjudged. */
@@ -70,6 +76,12 @@ export interface JudgeDeps {
    * is not known (see core anyYoungLinkDomain); absent, none is.
    */
   linkDomainYoung?: ((domains: readonly string[], at: Date) => Promise<boolean | null>) | undefined;
+  /**
+   * Whether every one of these destinations is known to be registered 7 days
+   * or more ago, by the same cache and lookup, null while an age is not known
+   * (see core linkDomainsAged); absent, none is.
+   */
+  linkDomainAged?: ((domains: readonly string[], at: Date) => Promise<boolean | null>) | undefined;
   /**
    * How images and files are read for the judge: the image reader (null
    * while ABUSE_VISION is off) and, in tests, the parsing threads and cache.
@@ -141,7 +153,7 @@ async function judgePending(
   const loaded = await loadBlockInput(db, deps.keyring, sample, now);
   if (!loaded) return unjudged("body_purged");
   const settings = await deps.settings();
-  const tier = await screeningTier(db, settings, sample.teamId, now);
+  const { tier, holdSpent } = await screeningTeam(db, settings, sample.teamId, now);
   const media = await readMedia(loaded.input, loaded.files, tier, deps.media);
   const issues = media?.issues ?? [];
   const standing = await teamDestinationStanding(db, {
@@ -165,9 +177,14 @@ async function judgePending(
       { teamId: sample.teamId, ...loaded.sendingDomain, shared },
       now,
     )) === true;
-  if (issues.includes("vision_blocked")) await notifyMediaBlocked(db, deps, sample.teamId, now);
   // Mail this verdict holds back keeps what screening read, for the person who decides on it.
   const waiting = sample.screening && loaded.waiting;
+  // Refused images on mail that waits are parked for review and can wait for
+  // the digest; on mail already out (possibly CSAM) the operator hears now.
+  if (issues.includes("vision_blocked")) {
+    if (waiting) await noteForDigest(db, sample.teamId, "media_blocked");
+    else await notifyMediaBlocked(db, deps, sample.teamId, now);
+  }
   let kept = false;
   const keepMedia = async () => {
     if (kept || !media || !loaded.email) return;
@@ -230,10 +247,56 @@ async function judgePending(
       : null;
   // A product's own page on a platform, read as a lure: the team is spared the hold, and the mail
   // parks unless an operator cleared every such name. Judged after the send with no such clearance,
-  // nothing is left to park, so the hold stands.
-  const platformShape = sample.broadcastId === null && isPlatformLinkVerdict(verdict, standing.all);
-  const vouched = platformShape && standing.all.every((d) => vouchedNames.has(d));
-  const platformLink = platformShape && (sample.screening || vouched);
+  // nothing is left to park, so the hold stands. A Pix code in the mail, in its text or read from
+  // its images and files, is a payment instrument, which no such page needs.
+  const paysByPix = (media?.findings.pix.length ?? 0) > 0 || mailCarriesPix(loaded.input);
+  const platformShape =
+    sample.broadcastId === null &&
+    !paysByPix &&
+    isPlatformLinkVerdict(verdict, standing.all, {
+      localMail: isLocalOnlyMail(
+        loaded.input,
+        media?.findings.links.map((link) => link.url),
+      ),
+    });
+  // A platform's notice for one client business, read as that business's impersonation, from a
+  // sending domain past young: spared and vouched as above. The vouch rests on the From name
+  // spelling the released site, so another brand's name on that site is held as before.
+  const clientSite =
+    sample.broadcastId === null && !paysByPix && !youngSendingDomain
+      ? clientIdentitySite(verdict, loaded.input, standing.all)
+      : null;
+  const clientShape = clientSite !== null;
+  const vouched = (platformShape || clientShape) && standing.all.every((d) => vouchedNames.has(d));
+  // Unvouched, the spare takes a notice whose every name, the site and any carrier beside it, is
+  // known to be registered 7 days or more ago, even one a clean verdict made no longer new to the
+  // team: no date, or one not known yet, keeps the hold. They are dated only when a hold rule could
+  // be met.
+  const clientSpared =
+    clientShape &&
+    sample.screening &&
+    !vouched &&
+    tier === "new" &&
+    !holdSpent &&
+    isHoldVerdict(verdict, Math.min(settings.holdScore, settings.holdRepeatScore)) &&
+    (destinations.length === 0 || linkYoung === false) &&
+    (await deps.linkDomainAged?.(standing.all, now)) === true;
+  const platformLink = vouched || (platformShape && sample.screening) || clientSpared;
+  // Mail to a destination that cleared within its probation, read as
+  // phishing from DESTINATION_REVOKE_SCORE: the clearance goes, and the operator hears of it, unless an
+  // operator's release vouched for this shape on it. A client business's
+  // notice keeps its released site's clearance while a link new beside it
+  // is screened.
+  const platformProbation =
+    sample.broadcastId === null &&
+    !paysByPix &&
+    isPlatformLinkVerdict(verdict, standing.probation) &&
+    standing.probation.every((d) => vouchedNames.has(d));
+  const probation = standing.probation.filter((d) => d !== clientSite || !vouchedNames.has(d));
+  const revoking =
+    !platformProbation && !vouched && isHoldVerdict(verdict, DESTINATION_REVOKE_SCORE)
+      ? probation
+      : [];
   // The verdict and its fold commit together: a crash between them would
   // leave a judged row the retry skips and a risk that never saw it.
   const outcome = await db.transaction(async (tx) => {
@@ -259,6 +322,9 @@ async function judgePending(
       .returning({ id: ms.id });
     // A concurrent run already wrote this sample: its verdict stands, the risk moved once.
     if (!judged) return null;
+    // Taken back before the verdict counts: a released spare resting on a
+    // name this verdict revokes counts toward the repeat hold again.
+    const revoked = await revokeDestinations(t, sample.teamId, revoking, now);
     const applied = await applyJudgedSample(t, settings, {
       teamId: sample.teamId,
       score: verdict.score,
@@ -273,7 +339,7 @@ async function judgePending(
     if (vouched) {
       await t.update(ms).set({ sparedHold: "vouched" }).where(eq(ms.id, sample.id));
     } else if (applied.spared) {
-      // The park rests on every platform name the mail links to; releasing it clears them all.
+      // The park rests on every name the spare rests on; releasing it clears them.
       await t
         .update(ms)
         .set({ sparedHold: applied.spared.rule, destinations: standing.all })
@@ -283,35 +349,14 @@ async function judgePending(
         holdRepeatScore: settings.holdRepeatScore,
       });
     }
-    return applied;
+    return { ...applied, revoked };
   });
   if (!outcome) return "skipped";
   if (verdictClearsDestinations(verdict, destinations.length)) {
     await clearDestinations(db, sample.teamId, destinations, now);
   }
-  // Mail to a destination that cleared within its probation, read as
-  // phishing: the clearance goes, and the operator hears of it.
-  const platformProbation =
-    sample.broadcastId === null &&
-    isPlatformLinkVerdict(verdict, standing.probation) &&
-    standing.probation.every((d) => vouchedNames.has(d));
-  if (
-    standing.probation.length > 0 &&
-    !platformProbation &&
-    isHoldVerdict(verdict, settings.holdRepeatScore)
-  ) {
-    const revoked = await revokeDestinations(db, sample.teamId, standing.probation, now);
-    if (revoked.length > 0) {
-      await notifyDestination(
-        db,
-        deps,
-        "monitor.destination_revoked",
-        sample.teamId,
-        verdict,
-        revoked,
-        now,
-      );
-    }
+  if (outcome.revoked.length > 0) {
+    await noteForDigest(db, sample.teamId, "destination_revoked");
   }
   const spareParks = sample.screening && outcome.spared !== null && !vouched;
   const destinationParks =
@@ -322,15 +367,7 @@ async function judgePending(
         outcome.tier !== "new" &&
         destinationVerdictParks({ ...verdict, linkYoung }, settings)));
   if (destinationParks) {
-    await notifyDestination(
-      db,
-      deps,
-      "monitor.destination_parked",
-      sample.teamId,
-      verdict,
-      destinations.length > 0 ? destinations : standing.all,
-      now,
-    );
+    await noteForDigest(db, sample.teamId, "destination_parked");
   }
   if (waiting && (destinationParks || outcome.held)) await keepMedia();
   if ((outcome.alert || outcome.paused || outcome.held) && deps.mailer) {
@@ -396,47 +433,6 @@ async function resumeScreened(
 }
 
 /**
- * The operator hears once a day per team, per kind, that mail to a new
- * destination was parked, or that a cleared destination drew a
- * phishing-type verdict and is new again; the review list holds every
- * parked email.
- */
-async function notifyDestination(
-  db: Db,
-  deps: JudgeDeps,
-  kind: "monitor.destination_parked" | "monitor.destination_revoked",
-  teamId: string,
-  verdict: Pick<JudgeVerdict, "score" | "categories" | "reasons">,
-  destinations: readonly string[],
-  now: Date,
-): Promise<void> {
-  if (!deps.mailer) return;
-  try {
-    const claimed = await claimNotification(db, { teamId, kind, periodKey: utcDay(now) });
-    if (!claimed) return;
-    const [team] = await db
-      .select({ name: schema.teams.name })
-      .from(schema.teams)
-      .where(eq(schema.teams.id, teamId));
-    await mailOperator(
-      db,
-      deps.mailer,
-      kind,
-      "/console/safety",
-      {
-        team: team?.name ?? teamId,
-        score: String(verdict.score),
-        verdict: [...verdict.categories, ...verdict.reasons].join(", "),
-        domain: destinations.slice(0, 5).join(", "),
-      },
-      deps.appBaseUrl,
-    );
-  } catch (err) {
-    console.error(`abuse.judge: destination mail for team ${teamId} failed`, err);
-  }
-}
-
-/**
  * The judge's input for a sample: the email's decrypted body and opened
  * files, or the broadcast's own HTML for a skeleton; with the sending
  * domain, whose age the hold reads, and the email itself: whether it still
@@ -469,6 +465,7 @@ async function loadBlockInput(
   const context: JudgeBlockInput["team"] = {
     name: team.name,
     verifiedDomains: domains.map((d) => d.name),
+    ownDomains: await teamOwnDomains(db, sample.teamId),
     ageDays: monitor.firstSendAt
       ? Math.floor((now.getTime() - monitor.firstSendAt.getTime()) / DAY_MS)
       : 0,
@@ -550,8 +547,7 @@ async function loadBlockInput(
 
 /**
  * The operator hears once a day per team that the image reader's provider
- * refused an email's images themselves, as Bedrock's CSAM check does;
- * unsent mail of it waits on the review list.
+ * refused the images of an email already sent, as Bedrock's CSAM check does.
  */
 async function notifyMediaBlocked(db: Db, deps: JudgeDeps, teamId: string, now: Date) {
   if (!deps.mailer) return;
@@ -634,7 +630,9 @@ async function notifyOperator(
         deps.appBaseUrl,
       );
     }
-    if (outcome.alert) {
+    // A hold or pause mail already tells the operator of the team; a team
+    // past New gets neither, so its alert is the only prompt to look.
+    if (outcome.alert && !held && !outcome.paused) {
       const overview = await teamMonitorOverview(db, teamId, settings, now);
       await mailOperator(
         db,

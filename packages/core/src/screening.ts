@@ -18,6 +18,7 @@ import type { MediaIssue } from "./abuse-judge/media.js";
 import {
   inFirstWindow,
   isHoldVerdict,
+  isSharedContentHost,
   loadMonitorState,
   MONITOR_HOLD_CATEGORIES,
   MONITOR_HOLD_REASONS,
@@ -29,8 +30,10 @@ import {
   YOUNG_DOMAIN_DAYS,
 } from "./abuse-monitor.js";
 import { countDistinctRecipients } from "./accept-email.js";
+import { disposableDomains, isDisposableDomain } from "./disposable-domains.js";
 import type { DomainAgeResolver } from "./domain-age.js";
-import { SHORTENER_HOSTS } from "./email-insights.js";
+import { PUBLIC_MAILBOX_DOMAINS } from "./domain-lifecycle.js";
+import { isShortener } from "./email-insights.js";
 import { addressKey } from "./inboxes/compose.js";
 import { threadSenders } from "./inboxes/send.js";
 import { isSharedInboxSender } from "./inboxes/send-policy.js";
@@ -40,13 +43,26 @@ import {
   resolveTextUrl,
   UNRESOLVED_DESTINATION,
 } from "./links.js";
+import {
+  mailboxProvider,
+  recipientDomain,
+  SES_MAILBOX_SIMULATOR_DOMAIN,
+} from "./mailbox-providers.js";
 import type { MonitorSettings } from "./monitor-settings.js";
-import { ownerDomain, registrableDomain } from "./org-domain.js";
+import {
+  asciiHostname,
+  isDomainOrSubdomain,
+  isLoopbackHost,
+  ownerDomain,
+  registeredName,
+  registrableDomain,
+  topLevelLabel,
+} from "./org-domain.js";
 import { releaseQuota } from "./quota.js";
 import { teamMemberEmails } from "./receiving/inbox-routing.js";
 import { parseSingleSender } from "./sender-address.js";
 import { fetchTeamQuota } from "./team-plan.js";
-import { DAY_MS, nextUtcDayStart, utcDay } from "./utc-day.js";
+import { DAY_MS, utcDay } from "./utc-day.js";
 
 /**
  * Screening before SES: which mail waits for the judge's verdict before it
@@ -91,8 +107,17 @@ const SCREEN_STALE_MS = 10 * 60_000;
 export const SCREEN_OUTSTANDING_MAX = 20;
 /** More new destinations than this in one message are not judged: an operator decides. */
 export const NOVEL_DESTINATIONS_MAX = 20;
-/** A team's daily screenings of mail for its new destinations; past it such mail waits a day. */
+/**
+ * The sets of new destinations a team's mail has screened today, which
+ * bounds the judge calls its mail to new destinations can force. Past it
+ * mail to a set not screened today is sent and judged after sending for an
+ * established or trusted team with no flag opened in PAST_CAP_CLEAN_DAYS,
+ * no hold-type verdict today and no revoked destination in the set, and
+ * parks for an operator otherwise.
+ */
 export const DESTINATION_SCREENS_PER_DAY = 200;
+/** A flag of any reason opened this recently parks a team's mail past DESTINATION_SCREENS_PER_DAY. */
+export const PAST_CAP_CLEAN_DAYS = 30;
 /**
  * A verdict clears a message's new destinations only under this score,
  * naming nothing phishing-type, and only when they are this many at most.
@@ -101,6 +126,8 @@ export const DESTINATION_CLEAR_BELOW = 70;
 export const DESTINATIONS_CLEARED_MAX = 5;
 /** For this long after a destination clears, every email to it is judged after sending. */
 export const DESTINATION_PROBATION_DAYS = 7;
+/** A verdict on mail to a destination in its probation takes its clearance back from this score. */
+export const DESTINATION_REVOKE_SCORE = 90;
 /** Link-age lookups one verdict waits on; the rest are looked up in the background. */
 export const LINK_AGE_LOOKUPS_PER_VERDICT = 3;
 /** A failed link-age lookup is not asked again for this long. */
@@ -140,14 +167,10 @@ const td = schema.teamDestinations;
 
 type Sample = typeof schema.monitorSamples.$inferSelect;
 
-/** A shortener's domain: it hides where a link leads, so it is never cleared. */
-export function isShortener(domain: string): boolean {
-  return [...SHORTENER_HOSTS].some((s) => domain === s || domain.endsWith(`.${s}`));
-}
-
-// What a link can resolve to: a DNS name (URL hands IDNs over in punycode),
-// or an address. A merge field still in a template is neither.
-const LINK_HOST = /^(?:[a-z0-9.-]+|\[[0-9a-f:.]+\])$/;
+// What a link can resolve to: a DNS name (URL hands IDNs over in punycode,
+// and keeps the underscore a browser resolves), or an address. A merge field
+// still in a template is neither.
+const LINK_HOST = /^(?:[a-z0-9._-]+|\[[0-9a-f:.]+\])$/;
 
 /**
  * Where a message sends its reader: the owner domain (ownerDomain, so a free
@@ -156,8 +179,8 @@ const LINK_HOST = /^(?:[a-z0-9.-]+|\[[0-9a-f:.]+\])$/;
  * URLs clients link in the text, each resolved as a browser resolves it and
  * read through redirect wrappers), of `links`, the URLs read from its
  * images and files, and of each Reply-To address; less the team's verified
- * domains and `ignore` (the platform's own hosts: unsubscribe and tracking
- * links). A link that leads nowhere this can read counts as
+ * domains, `ignore` (the platform's own hosts: unsubscribe and tracking
+ * links) and names off the public web (isUnreachableName). A link that leads nowhere this can read counts as
  * UNRESOLVED_DESTINATION, so the mail is screened. Each once, sorted.
  *
  * A verified domain owns what shares its owner domain, which the suffix list
@@ -186,13 +209,139 @@ export function messageDestinations(input: {
     if (domain) hosts.push(domain);
   }
   const own = new Set([...input.verifiedDomains.map(ownerDomain), ...(input.ignore ?? [])]);
-  return [...new Set(hosts.map(ownerDomain))].filter((d) => d !== "" && !own.has(d)).sort();
+  return [...new Set(hosts.map(ownerDomain))]
+    .filter((d) => d !== "" && !own.has(d) && !isUnreachableName(d))
+    .sort();
+}
+
+/**
+ * Platforms and consumer mailboxes nearly every sender links to (a footer's
+ * social icons, a WhatsApp button, a store badge, a support Gmail behind a
+ * mailto). Mail to them is still screened, since many of them host pages
+ * and files anyone publishes, but a team never loses a clearance over them
+ * nor counts one of them as its own.
+ */
+export const MAJOR_PLATFORM_DOMAINS: ReadonlySet<string> = new Set([
+  ...PUBLIC_MAILBOX_DOMAINS,
+  "facebook.com",
+  "instagram.com",
+  "wa.me",
+  "whatsapp.com",
+  "youtube.com",
+  "linkedin.com",
+  "x.com",
+  "twitter.com",
+  "tiktok.com",
+  "google.com",
+  "apple.com",
+]);
+
+const UNREACHABLE_TLDS: ReadonlySet<string> = new Set(["test", "invalid", "local", "internal"]);
+const UNREACHABLE_PARENTS = ["example.com", "example.net", "example.org"];
+
+/**
+ * A name off the public web, which serves nobody's pages: a reserved last
+ * label or a documentation domain. A loopback address is handled apart: see
+ * destinationStanding. UNRESOLVED_DESTINATION sits under .invalid yet stands
+ * for a link that could lead anywhere.
+ */
+function isUnreachableName(domain: string): boolean {
+  if (domain === UNRESOLVED_DESTINATION) return false;
+  return (
+    UNREACHABLE_TLDS.has(topLevelLabel(domain)) ||
+    UNREACHABLE_PARENTS.some((parent) => isDomainOrSubdomain(domain, parent))
+  );
+}
+
+const isMajorPlatform = (domain: string) => MAJOR_PLATFORM_DOMAINS.has(ownerDomain(domain));
+
+/**
+ * Major platforms whose own name serves pages anyone publishes (Google's
+ * docs, drive, sites and forms are common credential-harvest hosts): unlike
+ * the rest of MAJOR_PLATFORM_DOMAINS, a lure to one takes its clearance back.
+ */
+const REVOCABLE_PLATFORMS: ReadonlySet<string> = new Set(["google.com"]);
+
+const PUBLIC_MAILBOXES: ReadonlySet<string> = new Set(PUBLIC_MAILBOX_DOMAINS);
+
+/**
+ * Whether a name may stand for a team's own: a registered name nobody else
+ * shares. A mailbox provider, a shortener, a host every user's pages share,
+ * a bare suffix, an IP or the reader's own machine never does, whoever
+ * vouched for it, so no team can make a name strangers also use its own.
+ */
+function mayBeOwnDomain(name: string): boolean {
+  const registrable = registrableDomain(name);
+  return (
+    registeredName(name) !== null &&
+    !isLoopbackHost(name) &&
+    !isShortener(name) &&
+    !isMajorPlatform(name) &&
+    !isUnreachableName(name) &&
+    !isSharedContentHost(registrable) &&
+    !PUBLIC_MAILBOXES.has(registrable) &&
+    mailboxProvider(registrable) === "other"
+  );
+}
+
+/** The owner domains of the team's verified sending domains, sorted, each once. */
+async function heldDomains(db: Db, teamId: string): Promise<string[]> {
+  const d = schema.domains;
+  const verified = await db
+    .select({ name: d.name })
+    .from(d)
+    .where(and(eq(d.teamId, teamId), eq(d.status, "verified")));
+  return [
+    ...new Set(
+      verified
+        .map((row) => row.name)
+        .filter(mayBeOwnDomain)
+        .map(ownerDomain),
+    ),
+  ].sort();
+}
+
+/**
+ * The team's domains as the judge is told of them. `own`: those it holds
+ * (heldDomains), and the domains of its members' verified sign-in addresses
+ * that its mail already cleared as destinations, unless a mailbox provider
+ * or a disposable-mail service hands that address out. A sign-in address
+ * proves one mailbox, not the domain, so the domain first passes screening
+ * like any link. An operator's release says nothing of who owns a name, so
+ * it never makes one the team's own. Sorted, each once.
+ */
+export async function teamOwnDomains(db: Db, teamId: string): Promise<string[]> {
+  const [held, members, cleared, disposable] = await Promise.all([
+    heldDomains(db, teamId),
+    db
+      .select({ email: schema.user.email })
+      .from(schema.teamMembers)
+      .innerJoin(schema.user, eq(schema.user.id, schema.teamMembers.userId))
+      .where(and(eq(schema.teamMembers.teamId, teamId), eq(schema.user.emailVerified, true))),
+    db
+      .select({ domain: td.domain })
+      .from(td)
+      .where(and(eq(td.teamId, teamId), isNull(td.revokedAt))),
+    // The worker's daily copy; before its first download no address counts as disposable.
+    disposableDomains(db, new Set()),
+  ]);
+  const clearedNames = new Set(cleared.map((row) => row.domain));
+  const mailDomains = members.flatMap(({ email }) => {
+    const host = asciiHostname(email.slice(email.lastIndexOf("@") + 1));
+    return host && !isDisposableDomain(host, disposable) && mayBeOwnDomain(host)
+      ? [ownerDomain(host)]
+      : [];
+  });
+  return [...new Set([...held, ...mailDomains.filter((d) => clearedNames.has(d))])].sort();
 }
 
 /**
  * A message's destinations as its team stands with them: `novel`, never
  * cleared, revoked, or a shortener, which a shortener always is; and
- * `probation`, cleared under DESTINATION_PROBATION_DAYS before `now`.
+ * `probation`, cleared under DESTINATION_PROBATION_DAYS before `now`. A
+ * loopback address (isLoopbackHost) is none of these, nor `vouched`: no page
+ * a sender serves is there, so there is nothing to screen or date, and it
+ * vouches for nothing, whatever team_destinations holds for it.
  */
 export async function destinationStanding(
   db: Db,
@@ -208,10 +357,11 @@ export async function destinationStanding(
   const cleared = new Map(rows.map((row) => [row.domain, row.clearedAt.getTime()]));
   const vouched = new Set(rows.filter((row) => row.operatorClearedAt).map((row) => row.domain));
   const since = now.getTime() - DESTINATION_PROBATION_DAYS * DAY_MS;
+  const reachable = destinations.filter((d) => !isLoopbackHost(d));
   return {
-    novel: destinations.filter((d) => isShortener(d) || !cleared.has(d)),
-    probation: destinations.filter((d) => !isShortener(d) && (cleared.get(d) ?? 0) > since),
-    vouched: destinations.filter((d) => !isShortener(d) && vouched.has(d)),
+    novel: reachable.filter((d) => isShortener(d) || !cleared.has(d)),
+    probation: reachable.filter((d) => !isShortener(d) && (cleared.get(d) ?? 0) > since),
+    vouched: reachable.filter((d) => !isShortener(d) && vouched.has(d)),
   };
 }
 
@@ -242,18 +392,13 @@ export async function teamDestinationStanding(
     now: Date;
   },
 ): Promise<{ novel: string[]; probation: string[]; vouched: string[]; all: string[] }> {
-  const d = schema.domains;
-  const verified = await db
-    .select({ name: d.name })
-    .from(d)
-    .where(and(eq(d.teamId, input.teamId), eq(d.status, "verified")));
   const destinations = messageDestinations({
     html: input.html,
     text: input.text,
     replyTo: input.replyTo,
     links: input.links,
     ignore: input.ignore,
-    verifiedDomains: verified.map((row) => row.name),
+    verifiedDomains: await heldDomains(db, input.teamId),
   });
   return {
     ...(await destinationStanding(db, input.teamId, destinations, input.now)),
@@ -295,8 +440,9 @@ export function verdictClearsDestinations(
 
 /**
  * The team cleared these destinations: mail to them no longer waits. A
- * shortener never clears, and a verdict never clears a revoked destination
- * again; an operator's release (`operator`) does.
+ * shortener never clears, nor a loopback address, so a verdict resting on
+ * one is never vouched; a verdict never clears a revoked
+ * destination again; an operator's release (`operator`) does.
  */
 export async function clearDestinations(
   db: Db,
@@ -305,7 +451,7 @@ export async function clearDestinations(
   now: Date = new Date(),
   opts: { operator?: boolean } = {},
 ): Promise<void> {
-  const domains = destinations.filter((d) => !isShortener(d));
+  const domains = destinations.filter((d) => !isShortener(d) && !isLoopbackHost(d));
   if (domains.length === 0) return;
   const operatorClearedAt = opts.operator ? now : null;
   const rows = db
@@ -369,9 +515,11 @@ export async function spareWaitingSamples(
 }
 
 /**
- * Mail to these destinations drew a phishing-type verdict within their
- * probation: they are new again until an operator releases mail to them.
- * The ones revoked now.
+ * Mail to these destinations drew a phishing-type verdict from
+ * DESTINATION_REVOKE_SCORE within their probation: they are new again until
+ * an operator releases mail to them. A major platform
+ * (MAJOR_PLATFORM_DOMAINS, but for REVOCABLE_PLATFORMS) or a name off the
+ * public web (isUnreachableName) is never revoked. The ones revoked now.
  */
 export async function revokeDestinations(
   db: Db,
@@ -379,11 +527,17 @@ export async function revokeDestinations(
   destinations: readonly string[],
   now: Date,
 ): Promise<string[]> {
-  if (destinations.length === 0) return [];
+  const domains = destinations.filter(
+    (d) =>
+      (!isMajorPlatform(d) || REVOCABLE_PLATFORMS.has(ownerDomain(d))) &&
+      !isUnreachableName(d) &&
+      !isLoopbackHost(d),
+  );
+  if (domains.length === 0) return [];
   const rows = await db
     .update(td)
     .set({ revokedAt: now })
-    .where(and(eq(td.teamId, teamId), inArray(td.domain, [...destinations]), isNull(td.revokedAt)))
+    .where(and(eq(td.teamId, teamId), inArray(td.domain, domains), isNull(td.revokedAt)))
     .returning({ domain: td.domain });
   return rows.map((row) => row.domain);
 }
@@ -484,6 +638,10 @@ function queueLinkAges(
   })();
 }
 
+/** A link domain a registry can date: a registrable name, no free host's tenant, no shortener. */
+const datableLinkDomain = (d: string) =>
+  !isShortener(d) && registrableDomain(d) === d && ownerDomain(d) === d;
+
 /**
  * Whether any of these link domains was registered under YOUNG_DOMAIN_DAYS
  * before `at`: true as soon as one is known to be, false once every one is
@@ -503,11 +661,7 @@ export async function anyYoungLinkDomain(
   opts: { budgetMs: number },
 ): Promise<boolean | null> {
   const la = schema.linkDomainAges;
-  const datable = [
-    ...new Set(
-      domains.filter((d) => !isShortener(d) && registrableDomain(d) === d && ownerDomain(d) === d),
-    ),
-  ];
+  const datable = [...new Set(domains.filter(datableLinkDomain))];
   if (datable.length === 0) return false;
   const cached = await db
     .select({ domain: la.domain, registeredAt: la.registeredAt })
@@ -553,13 +707,40 @@ export async function anyYoungLinkDomain(
 }
 
 /**
+ * Whether every one of these link domains is known to be registered
+ * YOUNG_DOMAIN_DAYS or more before `at` (anyYoungLinkDomain, then the date it
+ * cached): false when one is young, has no date any source knows or is never
+ * dated, null while an age is not known.
+ */
+export async function linkDomainsAged(
+  db: Db,
+  resolver: DomainAgeResolver,
+  domains: readonly string[],
+  at: Date,
+  opts: { budgetMs: number },
+): Promise<boolean | null> {
+  const young = await anyYoungLinkDomain(db, resolver, domains, at, opts);
+  if (young !== false) return young === true ? false : null;
+  const names = [...new Set(domains)];
+  if (names.length === 0 || !names.every(datableLinkDomain)) return false;
+  const la = schema.linkDomainAges;
+  const dated = await db
+    .select({ domain: la.domain })
+    .from(la)
+    .where(and(inArray(la.domain, names), isNotNull(la.registeredAt)));
+  return dated.length === names.length;
+}
+
+/**
  * What screening reads of a team, once per send: its monitor tier, and
  * whether it is in its first window, both with the usage history so a quiet
- * old team is not new. An exempt team never has a first window.
+ * old team is not new. An exempt team never has a first window. `holdSpent`:
+ * the review hold already held the team once, so none can follow.
  */
 export interface ScreeningTeam {
   tier: MonitorTier;
   firstWindow: boolean;
+  holdSpent: boolean;
 }
 
 export async function screeningTeam(
@@ -568,9 +749,14 @@ export async function screeningTeam(
   teamId: string,
   now: Date,
 ): Promise<ScreeningTeam> {
-  const state = await loadMonitorState(db, await monitorRowWithHistory(db, teamId, now), now);
+  const row = await monitorRowWithHistory(db, teamId, now);
+  const state = await loadMonitorState(db, row, now);
   const tier = monitorTier(state, s, now);
-  return { tier, firstWindow: tier !== "exempt" && inFirstWindow(state, s, now) };
+  return {
+    tier,
+    firstWindow: tier !== "exempt" && inFirstWindow(state, s, now),
+    holdSpent: row.heldAt !== null,
+  };
 }
 
 /** A team's monitor tier as screening reads it (see screeningTeam). */
@@ -647,9 +833,7 @@ async function coldSharedSend(
   db: Db,
   email: Pick<ScreenedEmail, "teamId" | "inboxId" | "threadId" | "to" | "cc" | "bcc">,
 ): Promise<boolean> {
-  const recipients = [
-    ...new Set([...email.to, ...(email.cc ?? []), ...(email.bcc ?? [])].map(addressKey)),
-  ];
+  const recipients = recipientKeys(email);
   const { inboxId, threadId } = email;
   const c = schema.inboxCorrespondents;
   const [members, senders, wroteIn] = await Promise.all([
@@ -668,6 +852,34 @@ async function coldSharedSend(
   ]);
   const known = new Set([...members, ...senders, ...wroteIn.map((row) => row.address)]);
   return recipients.some((address) => !known.has(address));
+}
+
+/** Every address an email goes to, To, Cc and Bcc, each once in its compared form. */
+function recipientKeys(email: Pick<ScreenedEmail, "to" | "cc" | "bcc">): string[] {
+  return [...new Set([...email.to, ...(email.cc ?? []), ...(email.bcc ?? [])].map(addressKey))];
+}
+
+/**
+ * Whether an email goes to its own team's people and no one else: every
+ * recipient a member's login, or the SES mailbox simulator, on mail that is
+ * not a broadcast's copy. Such mail never waits on a verdict, though it
+ * parks as any mail does: a key taken from the team could aim a lure at the
+ * team's own people. The review hold still reads it, since a lure a sender
+ * tries on itself first is the earliest sign of one. An address on the
+ * team's own domains is not enough: a team's account, or a key taken from
+ * it, could reach its whole organisation's staff that way.
+ */
+export async function reachesOnlyTeam(
+  db: Db,
+  email: Pick<ScreenedEmail, "teamId" | "broadcastId" | "to" | "cc" | "bcc">,
+): Promise<boolean> {
+  if (email.broadcastId !== null) return false;
+  const recipients = recipientKeys(email);
+  if (recipients.length === 0) return false;
+  const members = new Set(await teamMemberEmails(db, email.teamId));
+  return recipients.every(
+    (address) => members.has(address) || recipientDomain(address) === SES_MAILBOX_SIMULATOR_DOMAIN,
+  );
 }
 
 /** What screening reads of one email before SES. */
@@ -829,6 +1041,13 @@ export type ScreenDecision =
       action: "send";
       sample: { id: string; unjudged: boolean } | null;
       probation?: boolean | undefined;
+      /**
+       * Its new destinations were not screened for it: a clean verdict on
+       * the same set today stands in, or the team's mail is past
+       * DESTINATION_SCREENS_PER_DAY and pastCapSends (startScreening). It is
+       * always judged after the send.
+       */
+      afterSend?: boolean | undefined;
     }
   /** Wait: run the send again at `until`, or when the judge re-queues it (null). */
   | { action: "wait"; until: Date | null }
@@ -839,19 +1058,80 @@ export type ScreenDecision =
    * for ("destination"), its images or files were not cleared ("media",
    * see mediaParks; a new team's flagged file parks on the send path's own
    * read, before any verdict), or the judge read cold shared-domain mail as
-   * phishing ("recipient").
+   * phishing ("recipient"). `unjudged`: the new destinations of mail
+   * parked past DESTINATION_SCREENS_PER_DAY (pastCapSends said no), which no
+   * verdict tells the operator of.
    */
-  | { action: "park"; reason: ScreenParkReason };
+  | { action: "park"; reason: ScreenParkReason; unjudged?: readonly string[] | undefined };
 
 const SEND_UNSCREENED: ScreenDecision = { action: "send", sample: null };
+
+/**
+ * Whether a team's mail past DESTINATION_SCREENS_PER_DAY goes out to be
+ * judged after sending: a settled team's volume is mostly legitimate, so it
+ * keeps flowing under after-send judgement; a newer team, one flagged for
+ * any reason within PAST_CAP_CLEAN_DAYS, one whose mail drew a hold-type
+ * verdict today (screening or after the send), or mail to a revoked
+ * destination waits for an operator. The verdict check is what stops a
+ * settled team, which no hold or pause stops, at its first phishing verdict
+ * rather than when the risk flag opens.
+ */
+async function pastCapSends(
+  db: Db,
+  s: Pick<MonitorSettings, "holdRepeatScore">,
+  input: { teamId: string; tier: MonitorTier; revoked: boolean; now: Date },
+) {
+  const { teamId, tier, now } = input;
+  if (input.revoked || (tier !== "established" && tier !== "trusted")) return false;
+  const verdicts = await db
+    .select({
+      verdict: ms.verdict,
+      score: ms.score,
+      categories: ms.categories,
+      reasons: ms.reasons,
+    })
+    .from(ms)
+    .where(
+      and(
+        eq(ms.teamId, teamId),
+        eq(ms.status, "judged"),
+        gte(ms.createdAt, new Date(`${utcDay(now)}T00:00:00Z`)),
+        gte(ms.score, s.holdRepeatScore),
+      ),
+    );
+  if (verdicts.some((v) => isHoldVerdict(v, s.holdRepeatScore))) return false;
+  const f = schema.teamFlags;
+  const [flag] = await db
+    .select({ id: f.id })
+    .from(f)
+    .where(
+      and(
+        eq(f.teamId, teamId),
+        gte(f.openedAt, new Date(now.getTime() - PAST_CAP_CLEAN_DAYS * DAY_MS)),
+      ),
+    )
+    .limit(1);
+  return flag === undefined;
+}
 
 /**
  * Starts screening an email that has a reason and no sample: more new
  * destinations than NOVEL_DESTINATIONS_MAX park for an operator unjudged; a
  * team with SCREEN_OUTSTANDING_MAX samples already waiting on the judge
- * waits its turn; one past its DESTINATION_SCREENS_PER_DAY waits for the
- * next UTC day when a new destination is the only reason. None of these
- * ever sends the email unscreened.
+ * waits its turn. When a new destination is the only reason, mail whose new
+ * destinations all sat in one message screened today needs no screening of
+ * its own: it waits on that verdict while it is pending, and once that
+ * verdict came back clean (under DESTINATION_CLEAR_BELOW, nothing
+ * phishing-type) and parked nothing, it is sent and judged after sending.
+ * A set holding a revoked destination is always screened as its own: only
+ * an operator's release vouches for it again.
+ * A verdict on the set today that would hold, screening or after the send,
+ * makes each later email to it screened as its own, so the first
+ * after-send verdict that reads such mail as phishing stops the rest. Past
+ * the day's DESTINATION_SCREENS_PER_DAY sets, mail that would be screened
+ * as its own is sent and judged after sending when pastCapSends, and parks
+ * for an operator otherwise; a repeat of a set already counted takes no
+ * slot. None of these waits for the next day.
  */
 async function startScreening(
   db: Db,
@@ -860,6 +1140,7 @@ async function startScreening(
   input: {
     email: { id: string; teamId: string; broadcastId: string | null };
     read: ScreeningRead;
+    tier: MonitorTier;
     unsafe: boolean;
     now: Date;
   },
@@ -867,6 +1148,71 @@ async function startScreening(
   const { email, read, now } = input;
   if (read.novel.length > NOVEL_DESTINATIONS_MAX) return { action: "park", reason: "destination" };
   const unsafe = read.reasons.includes("media") && input.unsafe;
+  const sameDay = and(
+    eq(ms.teamId, email.teamId),
+    gte(ms.createdAt, new Date(`${utcDay(now)}T00:00:00Z`)),
+    inArray(ms.kind, ["destination", "broadcast_copy"]),
+  );
+  const today = and(sameDay, eq(ms.screening, true));
+  const key = [...read.novel].sort();
+  const destinationOnly = read.reasons.length === 1 && read.reasons[0] === "destination";
+  const revoked =
+    key.length > 0 &&
+    (
+      await db
+        .select({ domain: td.domain })
+        .from(td)
+        .where(and(eq(td.teamId, email.teamId), inArray(td.domain, key), isNotNull(td.revokedAt)))
+        .limit(1)
+    ).length > 0;
+  // What never clears is judged on every message: one verdict says nothing of
+  // where the next shortened or unreadable link leads.
+  const repeatable =
+    !revoked &&
+    key.every((d) => d !== UNRESOLVED_DESTINATION && !isShortener(d) && !isLoopbackHost(d));
+  let counted = false;
+  if (destinationOnly && repeatable) {
+    // The judge rewrites a sample's destinations as every new one its message
+    // carried, so containment also matches a broadcast copy, whose own set
+    // leaves out the broadcast's, and an after-send draw.
+    const seen = await db
+      .select()
+      .from(ms)
+      .where(and(sameDay, sql`${ms.destinations} @> ${JSON.stringify(key)}::jsonb`));
+    // A verdict on the set that would hold, screening or after the send,
+    // speaks for none of it: the mail is screened as its own, under the cap.
+    const held = seen.some(
+      (sample) =>
+        sample.status === "judged" &&
+        (isHoldVerdict(sample, s.holdRepeatScore) || sample.sparedHold !== null),
+    );
+    const cleared = seen.some(
+      (sample) =>
+        !held &&
+        sample.screening &&
+        sample.status === "judged" &&
+        verdictClearsDestinations(
+          {
+            score: sample.score ?? 100,
+            categories: sample.categories ?? [],
+            reasons: sample.reasons ?? [],
+          },
+          0,
+        ) &&
+        !mediaParks(sample.mediaIssues, input.tier),
+    );
+    if (cleared) return { action: "send", sample: null, afterSend: true };
+    const pending = seen.some(
+      (sample) =>
+        !held &&
+        sample.screening &&
+        sample.status === "pending" &&
+        now.getTime() - sample.createdAt.getTime() <= SCREEN_STALE_MS,
+    );
+    // The judge re-queues only the sample's own email: this one looks again.
+    if (pending) return { action: "wait", until: new Date(now.getTime() + SCREEN_RETRY_MS) };
+    counted = !held && seen.some((sample) => sample.screening);
+  }
   const [outstanding] = await db
     .select({ n: sql<number>`count(*)::int` })
     .from(ms)
@@ -874,23 +1220,22 @@ async function startScreening(
   const full = (outstanding?.n ?? 0) >= SCREEN_OUTSTANDING_MAX;
   if (full && !unsafe) return { action: "wait", until: new Date(now.getTime() + SCREEN_RETRY_MS) };
   let destination = read.reasons.includes("destination");
-  if (destination && !full) {
+  if (destination && !full && !counted) {
+    // A sample without destinations counts as a set of its own.
     const [screened] = await db
-      .select({ n: sql<number>`count(*)::int` })
+      .select({
+        n: sql<number>`count(distinct coalesce(${ms.destinations}::text, ${ms.id}::text))::int`,
+      })
       .from(ms)
-      .where(
-        and(
-          eq(ms.teamId, email.teamId),
-          gte(ms.createdAt, new Date(`${utcDay(now)}T00:00:00Z`)),
-          eq(ms.screening, true),
-          inArray(ms.kind, ["destination", "broadcast_copy"]),
-        ),
-      );
+      .where(today);
     if ((screened?.n ?? 0) >= DESTINATION_SCREENS_PER_DAY) {
-      // Another reason screens it anyway, as that reason's sample.
-      if (read.reasons.length === 1 && !unsafe) {
-        return { action: "wait", until: nextUtcDayStart(now) };
+      if (destinationOnly) {
+        if (await pastCapSends(db, s, { teamId: email.teamId, tier: input.tier, revoked, now })) {
+          return { action: "send", sample: null, afterSend: true };
+        }
+        return { action: "park", reason: "destination", unjudged: key };
       }
+      // Another reason screens it anyway, as that reason's sample.
       destination = false;
     }
   }
@@ -906,6 +1251,7 @@ async function startScreening(
           : read.reasons.includes("first_window")
             ? "first_sends"
             : "anomaly",
+      destinations: destination ? key : undefined,
       now,
       screening: true,
     });
@@ -919,18 +1265,19 @@ async function startScreening(
 /**
  * The gate in front of SES for one queued customer email, on when the
  * judge (`deps`) and the auto-hold are. An email with a screening reason
- * and no verdict waits for one (startScreening); a phishing-type verdict
+ * and no verdict waits for one, or goes or parks as startScreening says; a phishing-type verdict
  * that held nothing waits SCREEN_HOLD_WAIT_MS more while its team is new
  * (first-window mail, broadcast copies, and mail whose new link domain's age
- * is not known), in case the burst it belongs to holds the team; mail to a
- * new destination of a team past new parks on a verdict that
- * destinationVerdictParks, and cold shared-domain mail of any team not
- * exempt on a phishing-type verdict from `holdRepeatScore`; a judge that
- * keeps failing parks a young domain's email, shared-domain mail included,
- * and lets an older one's through; media the judge could not clear parks
- * as mediaParks says. The team's own standing (a hold, a pause) is the
- * caller's to read first, on every pass; `team` is what it already read of
- * the team this pass.
+ * is not known), in case the burst it belongs to holds the team, unless the
+ * team's one hold is spent; mail to a new destination of a team past new
+ * parks on a verdict that destinationVerdictParks, and cold shared-domain
+ * mail of any team not exempt on a phishing-type verdict from
+ * `holdRepeatScore`; mail that reaches only the team's own people
+ * (reachesOnlyTeam) never waits; a judge that keeps failing parks a
+ * young domain's email, shared-domain mail included, and lets an older
+ * one's through; media the judge could not clear parks as mediaParks says.
+ * The team's own standing (a hold, a pause) is the caller's to read first,
+ * on every pass; `team` is what it already read of the team this pass.
  */
 export async function screenBeforeSend(
   db: Db,
@@ -977,6 +1324,7 @@ export async function screenBeforeSend(
       return startScreening(db, deps, s, {
         email,
         read,
+        tier: team.tier,
         unsafe: input.media?.unsafe === true,
         now,
       });
@@ -996,7 +1344,8 @@ export async function screenBeforeSend(
   if (waiting === "wait") return { action: "wait", until: null };
   if (waiting === "park") return { action: "park", reason: "screening" };
   if (waiting === "proceed") return { action: "send", sample: { id: sample.id, unjudged: true } };
-  // The hold this verdict met spared the team for a platform link: the mail waits for a person instead.
+  // The hold this verdict met spared the team (isPlatformLinkVerdict, clientIdentitySite): the
+  // mail waits for a person instead.
   if (sample.sparedHold && sample.sparedHold !== "vouched") {
     return { action: "park", reason: "destination" };
   }
@@ -1008,12 +1357,14 @@ export async function screenBeforeSend(
   if (shared && team.tier !== "exempt" && (await coldSharedSend(db, email))) {
     return { action: "park", reason: "recipient" };
   }
-  // An operator cleared every platform name the verdict rests on: nothing to wait for.
+  // An operator cleared every name the spare rests on: nothing to wait for.
   if (sample.sparedHold === "vouched") return { action: "send", sample: screened };
-  const waits = email.broadcastId
-    ? team.tier === "new"
-    : team.firstWindow || (team.tier === "new" && destinations > 0 && sample.linkYoung === null);
-  if (sample.judgedAt && waits) {
+  const waits =
+    !team.holdSpent &&
+    (email.broadcastId
+      ? team.tier === "new"
+      : team.firstWindow || (team.tier === "new" && destinations > 0 && sample.linkYoung === null));
+  if (sample.judgedAt && waits && !(await reachesOnlyTeam(db, email))) {
     const until = new Date(sample.judgedAt.getTime() + SCREEN_HOLD_WAIT_MS);
     if (now < until) return { action: "wait", until };
   }

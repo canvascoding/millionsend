@@ -7,14 +7,13 @@ import {
   MONITOR_SETTING_DEFAULTS,
   type MonitorSettings,
   NOVEL_DESTINATIONS_MAX,
-  nextUtcDayStart,
   releaseWaitingEmails,
   SCREEN_OUTSTANDING_MAX,
   sealAttachments,
 } from "@millionsend/core";
 import type { Db } from "@millionsend/db";
 import { schema } from "@millionsend/db";
-import { createTeam, createTestDb } from "@millionsend/test-utils";
+import { createTeam, createTestDb, digestCounts } from "@millionsend/test-utils";
 import { and, desc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { judgeSample } from "../src/handlers/abuse-judge.js";
@@ -119,7 +118,11 @@ const judge = (
       judge: answer,
       keyring,
       settings: async () => MONITOR_SETTING_DEFAULTS,
-      mailer: { send: async (_to, m) => void mails.push(m.kind) },
+      mailer: {
+        send: async (_to, m) => {
+          mails.push(m.kind);
+        },
+      },
       enqueueSend: async (emailId) => void resent.push(emailId),
       linkDomainYoung: async () => linkYoung,
       ...(now ? { now: () => now } : {}),
@@ -127,8 +130,8 @@ const judge = (
     { sampleId },
   );
 
-/** A team of a tier: new in its first window, new past it, or established. */
-async function team(slug: string, tier: "first" | "ramp" | "established") {
+/** A team of a tier: new in its first window, new past it, on probation, or established. */
+async function team(slug: string, tier: "first" | "ramp" | "probation" | "established") {
   const teamId = await createTeam(db, slug);
   const [domain] = await db
     .insert(schema.domains)
@@ -145,11 +148,23 @@ async function team(slug: string, tier: "first" | "ramp" | "established") {
     await db.insert(schema.teamMonitor).values({
       teamId,
       sentTotal: tier === "ramp" ? 2_000 : 20_000,
-      firstSendAt: new Date(Date.now() - (tier === "ramp" ? 4 : 200) * DAY),
+      firstSendAt: new Date(
+        Date.now() - (tier === "ramp" ? 4 : tier === "probation" ? 10 : 200) * DAY,
+      ),
     });
   }
   return { teamId, domainId: domain?.id ?? "", slug };
 }
+
+/** A flag opened ten days ago and cleared since. */
+const recentFlag = (teamId: string) =>
+  db.insert(schema.teamFlags).values({
+    teamId,
+    reason: "complaints",
+    status: "cleared",
+    openedAt: new Date(Date.now() - 10 * DAY),
+    clearedAt: new Date(Date.now() - 5 * DAY),
+  });
 
 async function email(
   t: { teamId: string; domainId: string; slug: string },
@@ -217,8 +232,7 @@ it("takes a platform name's clearance back unless an operator gave it, and then 
   expect(await sendEmail(db, sendDeps(), { emailId: lure })).toBe("sent");
   await judge((await sampleOf(lure))?.id ?? "", credentialOnly(93));
   expect((await clearance(t.teamId, "laundered.vercel.app"))?.revokedAt).not.toBeNull();
-  expect(mails).toContain("monitor.destination_revoked");
-  mails.length = 0;
+  expect(await digestCounts(db, t.teamId)).toEqual({ destination_revoked: 1 });
   // A name an operator released mail to: a credential-only verdict takes nothing back; a branded lure does.
   const reset = await email(t, link("my-app.vercel.app"));
   expect(await sendEmail(db, sendDeps(), { emailId: reset })).toBe("deferred");
@@ -233,12 +247,12 @@ it("takes a platform name's clearance back unless an operator gave it, and then 
   expect(await sendEmail(db, sendDeps(), { emailId: again })).toBe("sent");
   await judge((await sampleOf(again))?.id ?? "", credentialOnly(85));
   expect(await clearance(t.teamId, "my-app.vercel.app")).toMatchObject({ revokedAt: null });
-  expect(mails).not.toContain("monitor.destination_revoked");
+  expect((await digestCounts(db, t.teamId)).destination_revoked).toBe(1);
   const branded = await email(t, link("my-app.vercel.app"));
   expect(await sendEmail(db, sendDeps(), { emailId: branded })).toBe("sent");
-  await judge((await sampleOf(branded))?.id ?? "", verdict(85));
-  // The operator heard of a revoke today already; the clearance still goes.
+  await judge((await sampleOf(branded))?.id ?? "", verdict(92));
   expect((await clearance(t.teamId, "my-app.vercel.app"))?.revokedAt).not.toBeNull();
+  expect((await digestCounts(db, t.teamId)).destination_revoked).toBe(2);
 });
 
 it("takes a destination's clearance back when mail to it is read as phishing after it went out", async () => {
@@ -271,8 +285,14 @@ it("takes a destination's clearance back when mail to it is read as phishing aft
   const after = await sampleOf(lure);
   expect(after).toMatchObject({ kind: "destination", screening: false, status: "pending" });
   await judge(after?.id ?? "", verdict(85));
+  // Under 90 the clearance stands.
+  expect(await clearance(t.teamId, "agency-client.example")).toMatchObject({ revokedAt: null });
+  expect(await digestCounts(db, t.teamId)).toEqual({});
+  const sure = await email(t, link("agency-client.example"));
+  expect(await sendEmail(db, sendDeps(), { emailId: sure })).toBe("sent");
+  await judge((await sampleOf(sure))?.id ?? "", verdict(92));
   expect((await clearance(t.teamId, "agency-client.example"))?.revokedAt).not.toBeNull();
-  expect(mails).toContain("monitor.destination_revoked");
+  expect(await digestCounts(db, t.teamId)).toEqual({ destination_revoked: 1 });
 
   // Mail to it is screened before SES again, and parks; the team is never held.
   const next = await email(t, link("agency-client.example"));
@@ -298,22 +318,141 @@ it(`parks mail with more than ${NOVEL_DESTINATIONS_MAX} new destinations for the
   expect(await sampleOf(id)).toBeUndefined();
 });
 
-it("holds mail with a new destination past the team's daily budget until the next UTC day", async () => {
-  const t = await team("budget", "established");
-  await db.insert(schema.monitorSamples).values(
-    Array.from({ length: DESTINATION_SCREENS_PER_DAY }, () => ({
-      teamId: t.teamId,
+/** Screening samples of the day's new destinations, each a set of its own. */
+const screenedSets = (teamId: string, n: number) =>
+  db.insert(schema.monitorSamples).values(
+    Array.from({ length: n }, () => ({
+      teamId,
       kind: "destination" as const,
       screening: true,
       status: "judged" as const,
     })),
   );
-  const id = await email(t, link("over-budget.example"));
-  const now = Date.now();
-  expect(await sendEmail(db, sendDeps(), { emailId: id })).toBe("deferred");
-  expect(rescheduled).toEqual([{ emailId: id, at: nextUtcDayStart(now) }]);
-  expect(await sampleOf(id)).toBeUndefined();
+
+/** Six new destinations: more than one clean verdict clears, so each email to them is screened. */
+const sixLinks = (prefix: string) =>
+  Array.from({ length: 6 }, (_, i) => link(`${prefix}-${i}.example`)).join("");
+
+it("screens a set of new destinations once a day: mail repeating it waits on a clean verdict, then is judged after sending", async () => {
+  const t = await team("repeat-set", "established");
+  // Past the day's screenings a recently flagged team's mail parks.
+  await recentFlag(t.teamId);
+  await screenedSets(t.teamId, DESTINATION_SCREENS_PER_DAY - 1);
+  const first = await email(t, sixLinks("repeat"));
+  expect(await sendEmail(db, sendDeps(), { emailId: first })).toBe("deferred");
+  const sample = await sampleOf(first);
+  expect(sample).toMatchObject({ screening: true });
+
+  const again = await email(t, sixLinks("repeat"));
+  const before = Date.now();
+  expect(await sendEmail(db, sendDeps(), { emailId: again })).toBe("deferred");
+  expect(rescheduled.at(-1)?.at.getTime()).toBeGreaterThanOrEqual(before + 2 * 60_000);
+  expect(await sampleOf(again)).toBeUndefined();
+
+  await judge(sample?.id ?? "", verdict(30));
+  expect(await sendEmail(db, sendDeps(), { emailId: again })).toBe("sent");
+  const after = await sampleOf(again);
+  expect(after).toMatchObject({ kind: "destination", screening: false, status: "pending" });
+
+  // The day's screenings are spent, yet the repeat took none of them.
+  const other = await email(t, link("other.example"));
+  expect(await sendEmail(db, sendDeps(), { emailId: other })).toBe("parked");
+
+  // The after-send verdict reads the repeat as phishing: the next one is no
+  // repeat any more, and with the day's screenings spent it parks unsent.
+  await judge(after?.id ?? "", verdict(95));
+  const third = await email(t, sixLinks("repeat"));
+  expect(await sendEmail(db, sendDeps(), { emailId: third })).toBe("parked");
+  expect(await row(third)).toMatchObject({ parkReason: "destination" });
+  expect(await sampleOf(third)).toBeUndefined();
+  expect(sesCalls).toEqual([again]);
+});
+
+it("never sends a repeat on a verdict that was not clean: each is screened before sending", async () => {
+  const t = await team("repeat-dirty", "established");
+  const first = await email(t, link("dirty.example"));
+  await sendEmail(db, sendDeps(), { emailId: first });
+  await judge((await sampleOf(first))?.id ?? "", verdict(72));
+  const grey = await email(t, link("dirty.example"));
+  expect(await sendEmail(db, sendDeps(), { emailId: grey })).toBe("deferred");
+  expect(await sampleOf(grey)).toMatchObject({ screening: true, status: "pending" });
+
+  await judge((await sampleOf(grey))?.id ?? "", verdict(95));
+  expect(await sendEmail(db, sendDeps(), { emailId: grey })).toBe("parked");
+  const next = await email(t, link("dirty.example"));
+  expect(await sendEmail(db, sendDeps(), { emailId: next })).toBe("deferred");
+  expect(await sampleOf(next)).toMatchObject({ screening: true, status: "pending" });
   expect(sesCalls).toEqual([]);
+});
+
+for (const [tier, flagged] of [
+  ["ramp", false],
+  ["probation", false],
+  ["established", true],
+] as const) {
+  it(`parks a ${tier}${flagged ? ", recently flagged" : ""} team's mail with a new destination past the day's screenings, and tells the operator`, async () => {
+    const t = await team(`budget-${tier}`, tier);
+    if (flagged) await recentFlag(t.teamId);
+    await screenedSets(t.teamId, DESTINATION_SCREENS_PER_DAY);
+    const id = await email(t, link(`over-budget-${tier}.example`));
+    expect(await sendEmail(db, sendDeps(), { emailId: id })).toBe("parked");
+    expect(await row(id)).toMatchObject({
+      latestStatus: "queued_quota",
+      parkReason: "destination",
+    });
+    expect(await sampleOf(id)).toBeUndefined();
+    expect(mails).toEqual([]);
+    expect(await digestCounts(db, t.teamId)).toEqual({ destination_parked: 1 });
+    expect(rescheduled).toEqual([]);
+    expect(sesCalls).toEqual([]);
+  });
+}
+
+it("sends an established team's mail with a new destination past the day's screenings and judges it after sending", async () => {
+  const t = await team("budget-clean", "established");
+  await screenedSets(t.teamId, DESTINATION_SCREENS_PER_DAY);
+  const id = await email(t, link("over-budget-clean.example"));
+  const capped = { teamDailyCap: 0 };
+  expect(await sendEmail(db, sendDeps(capped), { emailId: id })).toBe("sent");
+  expect(await sampleOf(id)).toMatchObject({
+    kind: "destination",
+    screening: false,
+    status: "pending",
+  });
+  expect(judgeQueue).toHaveLength(1);
+  expect(mails).toEqual([]);
+  expect(sesCalls).toEqual([id]);
+
+  // One phishing verdict after the send stops the rest of the day's past-cap mail.
+  await judge((await sampleOf(id))?.id ?? "", verdict(95));
+  const next = await email(t, link("over-budget-next.example"));
+  expect(await sendEmail(db, sendDeps(capped), { emailId: next })).toBe("parked");
+  expect(await row(next)).toMatchObject({ parkReason: "destination" });
+  expect(sesCalls).toEqual([id]);
+});
+
+it("screens every email to a revoked destination, past a clean verdict on it and past the cap", async () => {
+  const t = await team("revoked-repeat", "established");
+  const past = new Date(Date.now() - 3 * DAY);
+  await db.insert(schema.teamDestinations).values({
+    teamId: t.teamId,
+    domain: "revoked.example",
+    clearedAt: past,
+    revokedAt: past,
+  });
+  const first = await email(t, link("revoked.example"));
+  expect(await sendEmail(db, sendDeps(), { emailId: first })).toBe("deferred");
+  await judge((await sampleOf(first))?.id ?? "", verdict(10));
+  expect(await sendEmail(db, sendDeps(), { emailId: first })).toBe("sent");
+  const again = await email(t, link("revoked.example"));
+  expect(await sendEmail(db, sendDeps(), { emailId: again })).toBe("deferred");
+  expect(await sampleOf(again)).toMatchObject({ screening: true, status: "pending" });
+  await judge((await sampleOf(again))?.id ?? "", verdict(10));
+
+  await screenedSets(t.teamId, DESTINATION_SCREENS_PER_DAY);
+  const capped = await email(t, link("revoked.example"));
+  expect(await sendEmail(db, sendDeps(), { emailId: capped })).toBe("parked");
+  expect(sesCalls).toEqual([first]);
 });
 
 it(`makes a team's next screening wait its turn behind ${SCREEN_OUTSTANDING_MAX} waiting on the judge`, async () => {
@@ -339,6 +478,7 @@ it("parks a team past new's lure when its new link domain's age is not known, an
   await judge((await sampleOf(parked))?.id ?? "", verdict(82), null);
   expect(await sendEmail(db, sendDeps(), { emailId: parked })).toBe("parked");
   expect(await row(parked)).toMatchObject({ parkReason: "destination" });
+  expect(await digestCounts(db, known.teamId)).toEqual({ destination_parked: 1 });
 
   const fresh = await team("age-unknown-new", "ramp");
   const waits = await email(fresh, link("age-hidden-2.example"));

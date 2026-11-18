@@ -78,9 +78,9 @@ export const MONITOR_SETTINGS = {
     kind: "count",
     default: 50_000,
   },
-  flagRisk: { column: "monitorFlagRisk", env: "MONITOR_FLAG_RISK", kind: "rate", default: 0.5 },
-  alertRisk: { column: "monitorAlertRisk", env: "MONITOR_ALERT_RISK", kind: "rate", default: 0.7 },
-  pauseRisk: { column: "monitorPauseRisk", env: "MONITOR_PAUSE_RISK", kind: "rate", default: 0.85 },
+  flagRisk: { column: "monitorFlagRisk", env: "MONITOR_FLAG_RISK", kind: "rate", default: 0.85 },
+  alertRisk: { column: "monitorAlertRisk", env: "MONITOR_ALERT_RISK", kind: "rate", default: 0.9 },
+  pauseRisk: { column: "monitorPauseRisk", env: "MONITOR_PAUSE_RISK", kind: "rate", default: 0.95 },
   autoPause: { column: "monitorAutoPause", env: "MONITOR_AUTO_PAUSE", kind: "bool", default: true },
   flagScore: { column: "monitorFlagScore", env: "MONITOR_FLAG_SCORE", kind: "score", default: 70 },
   autoHold: { column: "monitorAutoHold", env: "MONITOR_AUTO_HOLD", kind: "bool", default: true },
@@ -251,6 +251,14 @@ export function resolveMonitorSettings(
     }
   }
   return { settings: settings as MonitorSettings, sources };
+}
+
+/**
+ * The content monitor's flag line: the flag risk, or Infinity while the judge
+ * is off, so a stored risk crosses nothing.
+ */
+export function monitorFlagLine(settings: MonitorSettings | null): number {
+  return settings ? settings.flagRisk : Number.POSITIVE_INFINITY;
 }
 
 /** The flag, alert and pause lines must climb in that order or the policy contradicts itself. */

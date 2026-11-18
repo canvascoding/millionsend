@@ -208,28 +208,43 @@ export const en = {
     subject: "80% of today's sending quota used",
     body: [
       "{team} has used {used} of its {limit} emails for today.",
+      "{shared}",
       "Sends keep going out until {tolerance} past the quota; after that they queue until the quota resets at {resetsAt}. A higher plan raises the daily quota immediately.",
     ],
     button: "Review your plan",
     muted: ["You get this once per day when a team you own nears its quota."],
+    extra: {
+      shared:
+        "On the Free plan, every Free team created by the same person shares this daily limit, so the count above includes all of them.",
+    },
   },
   "quota.reached": {
     subject: "Today's sending quota reached",
     body: [
       "{team} has used its {limit} emails for today ({used} accepted).",
+      "{shared}",
       "{headroom} more still go out today (sends pass until {tolerance} past the quota); anything past that is queued and sent after the quota resets at {resetsAt}. A higher plan raises the daily quota immediately and releases queued mail within minutes.",
     ],
     button: "Review your plan",
     muted: ["You get this once per day when a team you own reaches its quota."],
+    extra: {
+      shared:
+        "On the Free plan, every Free team created by the same person shares this daily limit, so the count above includes all of them.",
+    },
   },
   "quota.paused": {
     subject: "Sending paused until the quota resets",
     body: [
       "{team} has used {used} emails today, {tolerance} past its {limit} quota, so new sends are queued instead of sent.",
+      "{shared}",
       "Queued mail goes out after the quota resets at {resetsAt}. A higher plan raises the daily quota immediately and releases the queue within minutes.",
     ],
     button: "Review your plan",
     muted: ["You get this once per day when a team you own passes the ceiling of its quota."],
+    extra: {
+      shared:
+        "On the Free plan, every Free team created by the same person shares this daily limit, so the count above includes all of them.",
+    },
   },
   "quota.monthly_warning": {
     subject: "80% of this period's sending quota used",
@@ -268,7 +283,8 @@ export const en = {
   "deliverability.warning": {
     subject: "Your {metric} is at risk",
     body: [
-      "{team}'s {metric} over the last {days} days is {rate}, above the {limit} risk line. Sending continues, but broadcasts are slowed while it stays there.",
+      "{team}'s {metric} {window} is {rate}, above the {limit} risk line. Sending continues, but broadcasts are slowed while it stays there.",
+      "{shared}",
       "{advice}",
     ],
     button: "Open metrics",
@@ -276,21 +292,33 @@ export const en = {
     extra: {
       bounce: "hard-bounce rate",
       complaint: "complaint rate",
+      bounceWindow: "over the last {days} days",
+      complaintWindow: "on mail sent over the last {days} days",
       bounceAdvice:
         "Hard bounces come from addresses that do not exist. Remove old or unverified addresses from your lists; every bounced address is already on your suppression list.",
       complaintAdvice:
         "Complaints come from recipients who did not expect the email. Send only to people who opted in, keep the unsubscribe link visible, and pause lists that have not heard from you in months.",
+      shared:
+        "On the Free plan, every Free team created by the same person shares one bounce and complaint record, deleted teams included: this rate counts all of them, and each one's broadcasts are slowed.",
     },
   },
   "deliverability.paused": {
     subject: "Sending paused ({metric})",
     body: [
-      "{team}'s {metric} over the last {days} days reached {rate}, at or above the {limit} pause line. New sends are refused until it recovers.",
+      "{team}'s {metric} {window} reached {rate}, at or above the {limit} pause line. New sends are refused until it recovers.",
+      "{shared}",
       "The pause lifts on its own once the rate over the window drops back under the line. Clean the recipient list first, or the next sends will trip it again.",
     ],
     button: "Open metrics",
     muted: ["You get this once per episode."],
-    extra: { bounce: "hard-bounce rate", complaint: "complaint rate" },
+    extra: {
+      bounce: "hard-bounce rate",
+      complaint: "complaint rate",
+      bounceWindow: "over the last {days} days",
+      complaintWindow: "on mail sent over the last {days} days",
+      shared:
+        "On the Free plan, every Free team created by the same person shares one bounce and complaint record, deleted teams included: this rate counts all of them, and the pause holds each one.",
+    },
   },
   "warmup.paused": {
     subject: "Warm-up paused for your domain",
@@ -421,7 +449,7 @@ export const en = {
     ],
     button: "Open broadcasts",
     extra: {
-      complaints: "the complaint rate passed 0.1% over the last 7 days.",
+      complaints: "the complaint rate on mail sent over the last 7 days passed 0.1%.",
       report: "an abuse report was received.",
       manual: "see the note below.",
       note: "Note from the operator: {note}",
@@ -448,6 +476,16 @@ export const en = {
       "The instance operator reinstated {team}. Sends go out again, and held broadcasts resume on their own within 15 minutes.",
     ],
     button: "Open dashboard",
+  },
+  "team.sending_pause_lifted": {
+    subject: "Your sending pause is lifted",
+    body: [
+      "We lifted the sending pause on {team}. New sends are accepted again, and the hard bounces behind the pause no longer count toward its bounce rate.{waiting}",
+      "Emails refused while sending was paused were not kept. Send again any that still matter.",
+      "Every bounce from now on counts. If the hard-bounce rate reaches {limit} again, sending pauses again and resumes on its own once the rate drops back under the line. Reply to this email if you have questions.",
+    ],
+    button: "Open metrics",
+    extra: { waiting: " Mail that was waiting is going out now." },
   },
   "monitor.alert": {
     subject: "Content monitor: a team needs a look",
@@ -522,32 +560,33 @@ export const en = {
       "Sent to the instance operator at most once every six hours while the share stays over 20%, the provider keeps rejecting the API key, or screening before sending gives up on mail.",
     ],
   },
-  "monitor.destination_parked": {
-    subject: "Content monitor parked mail to a new destination",
-    body: [
-      "{team} sent mail to a destination it had not used before ({domain}), and the judge scored it {score} ({verdict}). That mail waits on Trust & safety, where you release it, which sends it and makes the destination known to the team, or cancel it.",
-      "The team is not held: the rest of its mail flows, and it is not told. Mail to the same destination is judged before sending until one is cleared.",
-    ],
-    button: "Open review list",
-    muted: ["Sent to the instance operator at most once a day per team."],
-  },
   "monitor.media_blocked": {
     subject: "Content monitor: the image reader refused an email's images",
     body: [
       "Amazon Bedrock refused to read the images in an email from {team} (HTTP 400). Bedrock answers this way when its abuse detection blocks an image, which includes child sexual abuse material. No preview of these images is kept.",
-      "An email that had not been sent yet waits on Trust & safety until you release or cancel it; one judged after sending was already delivered. This alone does not hold the team, and the team is not told.",
+      "The email was judged after sending and was already delivered. This alone does not hold the team, and the team is not told. An email refused before sending waits on Trust & safety and is counted in the daily digest instead.",
     ],
     button: "Open review list",
     muted: ["Sent to the instance operator at most once a day per team."],
   },
-  "monitor.destination_revoked": {
-    subject: "Content monitor: mail to a cleared destination was judged as phishing",
+  "monitor.digest": {
+    subject: "Content monitor: daily digest",
     body: [
-      "{team} sent mail to {domain}, a destination its earlier mail had cleared in the last week, and the judge scored it {score} ({verdict}) after it went out. The destination is no longer cleared: mail to it is judged before sending again and waits on Trust & safety on a phishing-type verdict, and no verdict clears it again. Releasing mail to it from the review list does.",
-      "This alone does not hold the team: the rest of its mail flows, and it is not told.",
+      "Since the last digest the content monitor recorded these notices. None of them held a team or paused its broadcasts: those are mailed at once.",
     ],
     button: "Open review list",
-    muted: ["Sent to the instance operator at most once a day per team."],
+    muted: [
+      "Sent to the instance operator once a day, only when there is something to report. It gives counts only: the emails, destinations and verdicts are on each team's review page.",
+    ],
+    extra: {
+      team: "{team}: {counts}. {page}",
+      "destination_parked.one": "{n} time mail to a new destination was parked",
+      "destination_parked.other": "{n} times mail to new destinations was parked",
+      "destination_revoked.one": "{n} email that took a destination's clearance back",
+      "destination_revoked.other": "{n} emails that took destinations' clearance back",
+      "media_blocked.one": "{n} email whose images the image reader refused",
+      "media_blocked.other": "{n} emails whose images the image reader refused",
+    },
   },
 } as const satisfies Record<AccountMailKind, AccountMailEntry>;
 

@@ -706,7 +706,7 @@ para o log de auditoria da equipe.
 | Análise | 200 mensagens por caixa por dia; acima disso, o e-mail que precisa de análise vai para a quarentena (`screening_cap`). |
 | Espera | 50 segundos por requisição; 20 esperas ao mesmo tempo por equipe em cada processo da API. |
 | Rascunhos e lixeira | Um rascunho pendente expira em 7 dias; uma conversa na lixeira é excluída em 30. |
-| Retenção | Os e-mails das caixas seguem a retenção dos e-mails recebidos: 30 dias na nuvem. |
+| Retenção | Os e-mails das caixas seguem a retenção dos e-mails recebidos: 180 dias na nuvem. As respostas e mensagens novas enviadas de uma caixa também, então a conversa guarda os dois lados. |
 
 As caixas em si não custam nada: o e-mail recebido conta uma vez por
 mensagem, como em [Recebimento → Preços](/pt-BR/concepts/receiving#preços).
@@ -722,6 +722,13 @@ ganha uma linha para os e-mails dos outros endereços dele. A página de uma
 caixa tem quatro abas: **Conversas**, onde você lê, responde e aprova
 rascunhos ali mesmo, **Precisa de revisão** (rascunhos para aprovar e
 quarentena), **Segurança e regras** e **Atividade**.
+
+O item **Caixas de entrada** mostra quantas conversas não lidas há nas suas
+caixas de pessoas (a soma das não lidas da lista) e, depois de 99, mostra
+99+. No celular, um ponto no botão do menu avisa que há conversas não lidas.
+Quando alguém abre uma conversa, ela fica lida para a equipe toda. Caixas de
+agente nunca entram na conta, porque os e-mails não lidos delas são a fila
+do seu agente.
 
 Qualquer pessoa da equipe cria caixas, trabalha nas conversas, aprova
 rascunhos e libera a quarentena. Donos e admins também excluem caixas, mudam

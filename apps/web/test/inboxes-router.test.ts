@@ -13,7 +13,7 @@ import { LABEL_COLORS } from "@millionsend/core/inbox-organize";
 import type { Db } from "@millionsend/db";
 import { schema } from "@millionsend/db";
 import { createTeam, createTestDb } from "@millionsend/test-utils";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getKeyring } from "@/server/keyring";
 import type { SessionRole } from "@/server/membership";
@@ -48,6 +48,7 @@ const core = vi.hoisted(() => ({
   listQuarantined: vi.fn(),
   releaseQuarantined: vi.fn(),
   releasePreview: vi.fn(),
+  teamUnreadThreads: vi.fn(),
 }));
 vi.mock("@millionsend/core", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@millionsend/core")>()),
@@ -202,8 +203,19 @@ describe("where the instance takes no mail", () => {
     await expect(
       caller(acme).inboxes.updateSafety({ id: inboxId, patch: {} }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(caller(acme).inboxes.unread()).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(core.listInboxes).not.toHaveBeenCalled();
     expect(core.deleteInboxes).not.toHaveBeenCalled();
+    expect(core.teamUnreadThreads).not.toHaveBeenCalled();
+  });
+});
+
+describe("the sidebar's unread count", () => {
+  it("counts the session's team, for any member and under a support view", async () => {
+    core.teamUnreadThreads.mockResolvedValue(7);
+    expect(await caller(acme, "member").inboxes.unread()).toBe(7);
+    expect(await caller(acme, "viewer", view()).inboxes.unread()).toBe(7);
+    expect(core.teamUnreadThreads.mock.calls.map((call) => call[1])).toEqual([acme, acme]);
   });
 });
 
@@ -659,15 +671,15 @@ describe("safety rules", () => {
     });
   });
 
-  it("offers forward targets from the team's members, and the instance's retention", async () => {
+  it("offers forward targets from the team's members, and received mail's retention", async () => {
     core.getInboxSafety.mockResolvedValue(defaultSafety("agent", false));
     const read = await caller(acme, "member").inboxes.safety({ id: inboxId });
     expect(read.memberEmails).toEqual(["mo@acme.test", "owner@acme.test"]);
-    expect(read.retentionDays).toBeGreaterThan(0);
-    // Whole rows leaving first cut the bodies' longer clock short.
-    vi.stubEnv("EMAIL_RETENTION_DAYS", "90");
+    expect(read.retentionDays).toBe(180);
+    // The sent-mail clocks no longer apply to inbox mail.
     vi.stubEnv("EMAIL_METADATA_RETENTION_DAYS", "7");
-    expect((await caller(acme, "member").inboxes.safety({ id: inboxId })).retentionDays).toBe(7);
+    vi.stubEnv("RECEIVED_RETENTION_DAYS", "90");
+    expect((await caller(acme, "member").inboxes.safety({ id: inboxId })).retentionDays).toBe(90);
     core.getInboxSafety.mockResolvedValue(null);
     await expect(caller(beta).inboxes.safety({ id: inboxId })).rejects.toMatchObject({
       code: "NOT_FOUND",
@@ -824,8 +836,26 @@ describe("the inbox list", () => {
   it("offers the receiving domains, the shared domain and the plan's room to create", async () => {
     vi.stubEnv("SHARED_INBOX_DOMAIN", "agents.example.net");
     vi.stubEnv("IS_CLOUD", "true");
+    // Pending sorts after the verified domain that only lacks receiving, whatever its name.
+    const [pending] = await db
+      .insert(schema.domains)
+      .values({ teamId: acme, name: "a-pending.acme.test", region: "us-east-1" })
+      .returning({ id: schema.domains.id });
+    await db.insert(schema.domains).values({
+      teamId: beta,
+      name: "elsewhere.beta.test",
+      region: "us-east-1",
+      status: "verified",
+    });
     const options = await caller(acme).inboxes.options();
+    await db
+      .delete(schema.domains)
+      .where(inArray(schema.domains.name, ["a-pending.acme.test", "elsewhere.beta.test"]));
     expect(options.domains).toEqual([{ id: domainId, name: "in.acme.test" }]);
+    expect(options.otherDomains).toEqual([
+      { id: expect.any(String), name: "quiet.acme.test", status: "verified" },
+      { id: pending?.id, name: "a-pending.acme.test", status: "pending" },
+    ]);
     expect(options.sharedDomain).toBe("agents.example.net");
     expect(options.plan).toEqual({ used: 1, limit: PLAN_INBOX_LIMIT.free });
     vi.stubEnv("IS_CLOUD", "");

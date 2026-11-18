@@ -214,28 +214,43 @@ export const ptBR = {
     subject: "80% da cota de envio de hoje foi usada",
     body: [
       "{team} já usou {used} dos seus {limit} e-mails de hoje.",
+      "{shared}",
       "Os envios continuam saindo até {tolerance} acima da cota; depois disso, entram na fila até a cota renovar às {resetsAt}. Um plano maior aumenta a cota diária na hora.",
     ],
     button: "Revisar plano",
     muted: ["Você recebe isto uma vez por dia quando uma equipe sua se aproxima da cota."],
+    extra: {
+      shared:
+        "No plano Free, todas as equipes Free criadas pela mesma pessoa dividem este limite diário, então a contagem acima inclui todas elas.",
+    },
   },
   "quota.reached": {
     subject: "Cota de envio de hoje atingida",
     body: [
       "{team} usou os seus {limit} e-mails de hoje ({used} aceitos).",
+      "{shared}",
       "Mais {headroom} ainda saem hoje (os envios passam até {tolerance} acima da cota); o que passar disso entra na fila e sai depois que a cota renovar às {resetsAt}. Um plano maior aumenta a cota diária na hora e libera a fila em minutos.",
     ],
     button: "Revisar plano",
     muted: ["Você recebe isto uma vez por dia quando uma equipe sua atinge a cota."],
+    extra: {
+      shared:
+        "No plano Free, todas as equipes Free criadas pela mesma pessoa dividem este limite diário, então a contagem acima inclui todas elas.",
+    },
   },
   "quota.paused": {
     subject: "Envios pausados até a cota renovar",
     body: [
       "{team} usou {used} e-mails hoje, {tolerance} acima da cota de {limit}, então os novos envios entram na fila em vez de sair.",
+      "{shared}",
       "O que está na fila sai depois que a cota renovar às {resetsAt}. Um plano maior aumenta a cota diária na hora e libera a fila em minutos.",
     ],
     button: "Revisar plano",
     muted: ["Você recebe isto uma vez por dia quando uma equipe sua passa do teto da cota."],
+    extra: {
+      shared:
+        "No plano Free, todas as equipes Free criadas pela mesma pessoa dividem este limite diário, então a contagem acima inclui todas elas.",
+    },
   },
   "quota.monthly_warning": {
     subject: "80% da cota de envio deste período foi usada",
@@ -278,7 +293,8 @@ export const ptBR = {
   "deliverability.warning": {
     subject: "Sua {metric} está em risco",
     body: [
-      "A {metric} de {team} nos últimos {days} dias está em {rate}, acima do limite de risco de {limit}. Os envios continuam, mas as transmissões ficam mais lentas enquanto ela estiver acima do limite.",
+      "A {metric} de {team} {window} está em {rate}, acima do limite de risco de {limit}. Os envios continuam, mas as transmissões ficam mais lentas enquanto ela estiver acima do limite.",
+      "{shared}",
       "{advice}",
     ],
     button: "Abrir métricas",
@@ -288,21 +304,33 @@ export const ptBR = {
     extra: {
       bounce: "taxa de bounce permanente",
       complaint: "taxa de reclamação",
+      bounceWindow: "nos últimos {days} dias",
+      complaintWindow: "nos e-mails enviados nos últimos {days} dias",
       bounceAdvice:
         "Bounces permanentes vêm de endereços que não existem. Remova endereços antigos ou não verificados das suas listas; todo endereço com bounce já está na sua lista de supressão.",
       complaintAdvice:
         "Reclamações vêm de destinatários que não esperavam o e-mail. Envie só para quem se inscreveu, mantenha o link de descadastro visível e pause listas que não recebem nada seu há meses.",
+      shared:
+        "No plano Free, todas as equipes Free criadas pela mesma pessoa dividem um só histórico de bounces e reclamações, inclusive as excluídas: esta taxa conta todas elas, e as transmissões de cada uma ficam mais lentas.",
     },
   },
   "deliverability.paused": {
     subject: "Envios pausados ({metric})",
     body: [
-      "A {metric} de {team} nos últimos {days} dias chegou a {rate}, no limite de pausa de {limit} ou acima dele. Novos envios são recusados até ela baixar.",
+      "A {metric} de {team} {window} chegou a {rate}, no limite de pausa de {limit} ou acima dele. Novos envios são recusados até ela baixar.",
+      "{shared}",
       "A pausa termina sozinha quando a taxa na janela volta a ficar abaixo do limite. Limpe a lista de destinatários antes, ou os próximos envios vão acioná-la de novo.",
     ],
     button: "Abrir métricas",
     muted: ["Você recebe isto uma vez por episódio."],
-    extra: { bounce: "taxa de bounce permanente", complaint: "taxa de reclamação" },
+    extra: {
+      bounce: "taxa de bounce permanente",
+      complaint: "taxa de reclamação",
+      bounceWindow: "nos últimos {days} dias",
+      complaintWindow: "nos e-mails enviados nos últimos {days} dias",
+      shared:
+        "No plano Free, todas as equipes Free criadas pela mesma pessoa dividem um só histórico de bounces e reclamações, inclusive as excluídas: esta taxa conta todas elas, e a pausa vale para cada uma.",
+    },
   },
   "warmup.paused": {
     subject: "Aquecimento pausado no seu domínio",
@@ -437,7 +465,7 @@ export const ptBR = {
     ],
     button: "Abrir transmissões",
     extra: {
-      complaints: "a taxa de reclamações passou de 0,1% nos últimos 7 dias.",
+      complaints: "a taxa de reclamações dos e-mails enviados nos últimos 7 dias passou de 0,1%.",
       report: "uma denúncia de abuso foi recebida.",
       manual: "veja a observação abaixo.",
       note: "Observação do operador: {note}",
@@ -464,6 +492,16 @@ export const ptBR = {
       "O operador da instância reativou {team}. Os envios voltam a sair, e as transmissões em espera são retomadas automaticamente em até 15 minutos.",
     ],
     button: "Abrir painel",
+  },
+  "team.sending_pause_lifted": {
+    subject: "A pausa de envios da sua equipe foi retirada",
+    body: [
+      "Retiramos a pausa de envios de {team}. Novos envios voltaram a ser aceitos, e os bounces permanentes que causaram a pausa não contam mais na sua taxa.{waiting}",
+      "Os e-mails recusados durante a pausa não ficaram guardados. Envie de novo os que ainda forem importantes.",
+      "Daqui em diante, todo bounce conta. Se a taxa de bounce permanente chegar de novo a {limit}, os envios pausam outra vez e só voltam sozinhos quando a taxa ficar abaixo do limite. Se tiver alguma dúvida, é só responder a este e-mail.",
+    ],
+    button: "Abrir métricas",
+    extra: { waiting: " Os e-mails que estavam esperando já estão saindo." },
   },
   "monitor.alert": {
     subject: "Monitor de conteúdo: uma equipe precisa de uma olhada",
@@ -538,32 +576,33 @@ export const ptBR = {
       "Enviado ao operador da instância no máximo a cada seis horas enquanto o percentual ficar acima de 20%, o provedor continuar recusando a chave de API ou a avaliação antes do envio desistir de algum e-mail.",
     ],
   },
-  "monitor.destination_parked": {
-    subject: "O monitor de conteúdo deixou em espera e-mails para um destino novo",
-    body: [
-      "{team} enviou e-mails para um destino que nunca tinha usado ({domain}), e o avaliador deu pontuação {score} ({verdict}). Esses e-mails estão em espera em Confiança e segurança, onde você os libera, o que os envia e torna o destino conhecido da equipe, ou os cancela.",
-      "A equipe não fica pausada para revisão: o resto do e-mail dela continua saindo, e ela não fica sabendo. E-mails para o mesmo destino são avaliados antes do envio até que um seja liberado.",
-    ],
-    button: "Abrir lista de revisão",
-    muted: ["Enviado ao operador da instância no máximo uma vez por dia por equipe."],
-  },
   "monitor.media_blocked": {
     subject: "Monitor de conteúdo: o leitor de imagens recusou as imagens de um e-mail",
     body: [
       "O Amazon Bedrock se recusou a ler as imagens de um e-mail de {team} (HTTP 400). O Bedrock responde assim quando a detecção de abuso dele bloqueia uma imagem, o que inclui material de abuso sexual infantil. Nenhuma prévia dessas imagens fica guardada.",
-      "Um e-mail que ainda não tinha sido enviado fica em espera em Confiança e segurança até você liberar ou cancelar; um avaliado depois do envio já foi entregue. Isso sozinho não deixa a equipe pausada para revisão, e ela não fica sabendo.",
+      "O e-mail foi avaliado depois do envio e já foi entregue. Isso sozinho não deixa a equipe pausada para revisão, e ela não fica sabendo. Um e-mail recusado antes do envio fica em espera em Confiança e segurança e entra no resumo diário.",
     ],
     button: "Abrir lista de revisão",
     muted: ["Enviado ao operador da instância no máximo uma vez por dia por equipe."],
   },
-  "monitor.destination_revoked": {
-    subject: "Monitor de conteúdo: e-mail para um destino já liberado foi avaliado como phishing",
+  "monitor.digest": {
+    subject: "Monitor de conteúdo: resumo diário",
     body: [
-      "{team} enviou e-mail para {domain}, um destino que e-mails anteriores tinham liberado na última semana, e o avaliador deu pontuação {score} ({verdict}) depois do envio. O destino deixou de estar liberado: e-mails para ele voltam a ser avaliados antes do envio e ficam em espera em Confiança e segurança com uma avaliação do tipo phishing, e nenhuma avaliação o libera de novo. Liberar e-mails para ele na lista de revisão libera.",
-      "Isso sozinho não deixa a equipe pausada para revisão: o resto do e-mail dela continua saindo, e ela não fica sabendo.",
+      "Desde o último resumo, o monitor de conteúdo registrou estes avisos. Nenhum deles pausou uma equipe para revisão nem as transmissões dela: esses são enviados na hora.",
     ],
     button: "Abrir lista de revisão",
-    muted: ["Enviado ao operador da instância no máximo uma vez por dia por equipe."],
+    muted: [
+      "Enviado ao operador da instância uma vez por dia, só quando há algo a informar. Traz apenas contagens: os e-mails, os destinos e as avaliações estão na página de revisão de cada equipe.",
+    ],
+    extra: {
+      team: "{team}: {counts}. {page}",
+      "destination_parked.one": "{n} vez em que e-mails para um destino novo ficaram em espera",
+      "destination_parked.other": "{n} vezes em que e-mails para destinos novos ficaram em espera",
+      "destination_revoked.one": "{n} e-mail que tirou a liberação de um destino",
+      "destination_revoked.other": "{n} e-mails que tiraram a liberação de destinos",
+      "media_blocked.one": "{n} e-mail cujas imagens o leitor de imagens recusou",
+      "media_blocked.other": "{n} e-mails cujas imagens o leitor de imagens recusou",
+    },
   },
 } as const satisfies Record<AccountMailKind, AccountMailEntry>;
 

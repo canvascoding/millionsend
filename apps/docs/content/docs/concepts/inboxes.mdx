@@ -673,7 +673,7 @@ dashboard also go to the team's audit log.
 | Screening | 200 messages per inbox per day; past it, mail that needs screening is quarantined (`screening_cap`). |
 | Waiting | 50 seconds per request; 20 waits at once per team on each API process. |
 | Drafts and trash | A pending draft expires after 7 days; a trashed thread is deleted after 30. |
-| Retention | Inbox mail follows received mail's retention: 30 days on Cloud. |
+| Retention | Inbox mail follows received mail's retention: 180 days on Cloud. Replies and new messages sent from an inbox follow it too, so a thread keeps both sides. |
 
 Inboxes themselves cost nothing: received mail counts once per message, as
 in [Receiving → Pricing](/concepts/receiving#pricing).
@@ -688,6 +688,12 @@ and each catch-all domain gets a row for the mail at its other addresses. An
 inbox's page has four tabs: **Threads**, where you read, reply and approve
 drafts in place, **Needs review** (drafts to approve and quarantine),
 **Safety & rules** and **Activity**.
+
+The **Inboxes** item shows how many threads are unread across your people
+inboxes (the list's unread counts added up), and 99+ past 99. On a phone, a
+dot on the menu button says there are unread threads. Read state belongs to
+the team: a thread one person opens is read for everyone. Agent inboxes never
+count, since their unread mail is your agent's queue.
 
 Any member can create inboxes, work their threads, approve drafts and release
 quarantine. Owners and admins can also delete inboxes, change safety rules,
